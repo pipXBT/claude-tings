@@ -9,6 +9,7 @@ Each subdirectory is an independent skill: a `SKILL.md` (with YAML frontmatter t
 | Skill | What it does |
 |-------|--------------|
 | [parallel-orchestrate](./parallel-orchestrate/) | Read a design doc, decompose into parallelizable work units, then fan out one Opus agent per unit into its own [cmux](https://cmux.com) workspace tab. Each fork inherits the orchestrator's recon as live conversation context (via JSONL fork) and works in an isolated git worktree. |
+| [skill-postmortem](./skill-postmortem/) | Review the effectiveness of *another* skill against actual session evidence. Reads JSONLs where the skill was invoked, categorizes friction across eight categories, confidence-ranks findings, and proposes evidence-backed edits — user approves each before it lands. Methodology adapted from STRML's `session-learnings`. |
 
 More to come.
 
