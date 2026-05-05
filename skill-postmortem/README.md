@@ -1,12 +1,11 @@
 # skill-postmortem
 
-A Claude Code skill that reviews the effectiveness of *another* skill against actual session evidence and proposes evidence-backed edits to its `SKILL.md`, scripts, or references.
-
-**Methodology** adapted from [STRML/cc-skills](https://github.com/STRML/cc-skills/blob/main/skills/session-learnings/SKILL.md)'s `session-learnings` skill: *watch → categorize → apply → anti-patterns*. Retargeted from "this session into project CLAUDE.md" to "many sessions into the skill's own files," with explicit confidence ranking added because cross-session signals are stronger than single-session.
+A Claude Code skill that reviews the effectiveness of *another* skill against actual session evidence and proposes evidence-backed edits to its `SKILL.md`, scripts, or references — with the user approving each edit before it lands.
 
 ## Why
 
-Skills don't get better on their own. The first version of any skill encodes assumptions that turn out to be wrong on first contact with reality (CLI shapes, path conventions, edge cases). Without a structured review, you either:
+Skills don't get better on their own. The first version of any skill encodes assumptions that turn out to be wrong on first contact with reality (CLI shapes, path conventions, edge cases). Without a structured review you either:
+
 - Edit reactively in the moment (loses the cross-session pattern)
 - Never edit (skills calcify with broken instructions)
 - Let Claude "self-improve" autonomously (skills drift in unintended directions)
@@ -15,20 +14,20 @@ Skills don't get better on their own. The first version of any skill encodes ass
 
 ## When to use
 
-- A skill you wrote misbehaved during real use
-- You've used a skill for a while and want a structured review
+- A skill misbehaved during real use and you want to know why
+- A skill has been used multiple times and warrants a structured review
 - You suspect a skill's `description` is misfiring (wrong invocations, missed invocations)
-- You want to clean up before publishing the skill more widely
+- You want to clean up a skill before publishing it more widely
 
 ## When NOT to use
 
-- Skill has fewer than 2–3 real invocations — not enough evidence
-- You already know the exact edit — go straight to `superpowers:writing-skills`
+- Skill has fewer than two or three real invocations — not enough evidence
+- You already know the exact edit — go straight to editing the SKILL.md
 - Plugin-namespaced skill (`<plugin>:<name>`) — edit upstream and open a PR
 
 ## Install
 
-Part of the [`pipXBT/claude-tings`](https://github.com/pipXBT/claude-tings) collection. See top-level [README](../README.md) for install instructions, or:
+Part of the [`pipXBT/claude-tings`](https://github.com/pipXBT/claude-tings) collection. See top-level [README](../README.md) for collection install, or:
 
 ```bash
 git clone https://github.com/pipXBT/claude-tings.git ~/code/claude-tings
@@ -49,7 +48,7 @@ or
 > Review the effectiveness of skill X.
 ```
 
-Claude reads the most recent JSONLs that invoked the skill, categorizes friction (A–H), confidence-ranks each finding, and proposes specific edits. You approve each edit before it lands.
+Claude reads the most recent JSONLs that invoked the skill, categorizes friction across eight categories (A–H), confidence-ranks each finding, and proposes specific edits. You approve each edit before it lands.
 
 ## Output shape
 
@@ -60,7 +59,7 @@ Friction summary:
   Category B (wrong CLI shape):      2 high, 1 medium
   Category E (hardcoded assumption): 1 high
   Category F (manual workaround):    1 high, 2 medium
-  Total:                             4 high-confidence edits proposed.
+Total: 4 high-confidence edits proposed.
 
 Edit 1 of 4 — Category E (hardcoded assumption):
   Finding: encode_project_path doesn't handle paths with spaces.
@@ -79,11 +78,11 @@ Apply 1, 3, 4? Skip 2? Pick a subset?
 
 | Code | Name | Symptom |
 |------|------|---------|
-| A | Spec gap | Claude asks a clarifying question the skill should have answered |
-| B | Wrong CLI / API shape | Tool errors, "Unknown action," "command not found" |
+| A | Spec gap | Claude asked a clarifying question the skill should have answered |
+| B | Wrong CLI / API shape | Tool errors, "Unknown action", "command not found" |
 | C | Trigger phrase miss | User had to name the skill explicitly |
-| D | Scope ambiguity | Claude does too much / too little, user redirects |
-| E | Hardcoded assumption | Script breaks on a real environment (paths, OS, versions) |
+| D | Scope ambiguity | Claude did too much / too little, user redirected |
+| E | Hardcoded assumption | Script broke on a real environment (paths, OS, versions) |
 | F | Manual workaround | User wrote inline code instead of using the bundled script |
 | G | Preflight too strict / too loose | Aborts on cases that should run, or runs through cases it should catch |
 | H | Description-trigger collision | Skill fires when it shouldn't, or doesn't fire when it should |
@@ -96,7 +95,7 @@ skill-postmortem/
 └── README.md    # this file
 ```
 
-No bundled scripts. Operations (find sessions → grep → read → propose edit) are native to Claude.
+No bundled scripts. Operations (find sessions, grep, read, propose edit) are native to Claude.
 
 ## License
 

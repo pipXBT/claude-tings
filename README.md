@@ -93,11 +93,3 @@ my-skill/
 ## License
 
 [MIT](./LICENSE). Do whatever you want; no warranty.
-
-## Credits
-
-Many ideas borrowed from skill collections that came first — see each skill's `SKILL.md` Credits section. Special call-outs:
-
-- [STRML/cc-skills](https://github.com/STRML/cc-skills) — the JSONL-fork-inherits-context trick (`cc-fork`) and the recon→fanout→reconcile shape (`/code-cleanup`).
-- [obra/superpowers](https://github.com/obra/superpowers) — the rigid-vs-flexible skill taxonomy and the "stop and report partial — don't guess" pattern.
-- [manaflow-ai/cmux](https://github.com/manaflow-ai/cmux) — the workspace-tab UX that makes parallel agents watchable.
