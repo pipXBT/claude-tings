@@ -11,7 +11,7 @@ Read this only when extending the script or debugging an unexpected behaviour. T
    - In worktree mode: `git worktree add -b parallel/<tag>/<name> <repo>/../<repo>-worktrees/<tag>/<name>`.
    - Compute the target cwd's encoded project dir (`~/.claude/projects/<encoded-target-cwd>/`) and `mkdir -p` it.
    - Copy parent JSONL → `<encoded-target-cwd>/<uuid>.jsonl`. **This is the load-bearing step**: `claude --resume <uuid>` resolves against the *cwd of the launching shell*, not the parent's cwd. If the JSONL isn't in the new cwd's project dir, --resume fails with "session not found".
-   - Build a shell command: `cd <wt> && claude --resume <uuid> --model opus --permission-mode acceptEdits '<prompt>'`.
+   - Build a shell command: `cd <wt> && claude --resume <uuid> --model opus --dangerously-skip-permissions '<prompt>'`.
    - `cmux new-workspace --command "<that command>"`.
    - Parse the workspace ref from cmux output. If found, `cmux rename-workspace --workspace <ref> '<tag>:<name>'` so the sidebar tab is human-readable.
 4. **Manifest.** Write `.tmp/parallel-orchestrate/<tag>/manifest.json` listing every fork's UUID, target cwd, branch, workspace ref, and JSONL path. The cleanup pass and the orchestrator's monitoring read this.
@@ -21,11 +21,13 @@ Read this only when extending the script or debugging an unexpected behaviour. T
 
 `--cleanup --session-tag <tag>` reads the manifest and reverses each step: removes the forked JSONL files, closes the cmux workspaces, and (with `--remove-worktrees`) removes the worktrees. Reports stay by default — pass `--purge-session-dir` to wipe them too.
 
-## Why permissions are `acceptEdits`
+## Why permissions are `--dangerously-skip-permissions`
 
-Forks are non-interactive in the sense that the orchestrator can't easily approve every Edit/Write. `--permission-mode acceptEdits` lets each Opus agent edit files in its scope without prompting. This is safe in worktree mode because each fork's edits are isolated. In `shared` or `dry-run` mode, consider tightening — or have the agent run in plan mode and produce patches in its report.
+Forks are non-interactive in the sense that the orchestrator can't easily approve every Edit/Write/Bash. Earlier versions used `--permission-mode acceptEdits`, but that still prompts for `Bash` and other non-edit tools (e.g., `pnpm install`, `git commit`, network fetches), which silently stalled agents that needed those primitives — the prompt fires inside the agent's cmux tab where nobody is watching to approve.
 
-If you want strict permissions, edit the `claude_part` line in `spawn_one()` to remove `--permission-mode acceptEdits`. Each fork will then prompt in its own cmux tab; the user can approve from there, but loses the "set it and forget it" property.
+`--dangerously-skip-permissions` removes ALL approval prompts so the agent can run end-to-end without intervention. This is acceptable in worktree mode because each fork's edits are isolated to a sibling working tree branched from a known substrate; the orchestrator inspects every commit at reconcile before merging. In `shared` mode the blast radius is wider — consider whether the agents' mandates are tight enough to justify it. In `dry-run` mode the agents shouldn't be executing anyway, so the flag is harmless.
+
+If you want stricter permissions, edit the `claude_part` line in `spawn_one()` to use `--permission-mode acceptEdits` (file edits auto-approved, other tools prompt) or drop the flag entirely (everything prompts). Either way, the agent's tab needs human attention; the "set it and forget it" property is lost.
 
 ## Why we do not use cc-fork directly
 

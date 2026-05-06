@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -40,8 +41,8 @@ from pathlib import Path
 
 
 def encode_project_path(p: Path) -> str:
-    """Claude Code encodes the project path by replacing / and . with -."""
-    return re.sub(r"[/.]", "-", str(p.resolve()))
+    """Claude Code encodes the project path by replacing /, ., and space with -."""
+    return re.sub(r"[/. ]", "-", str(p.resolve()))
 
 
 def claude_project_dir(cwd: Path) -> Path:
@@ -157,49 +158,75 @@ def list_worktrees(repo_root: Path) -> list[dict]:
 # ------------------------------------------------------------------------ cmux
 
 
-def cmux_new_workspace(command: str, name: str) -> str:
-    """Create a new cmux workspace running `command`. Returns the workspace ref.
-    cmux prints the new ref to stdout; we capture it.
+def cmux_current_pane() -> str:
+    """Return the orchestrator's current pane ref via `cmux identify`.
+    Each spawned terminal tab is added to this pane so the user sees them
+    as new tabs alongside the orchestrator, not in a separate workspace.
     """
-    # `cmux new-workspace --command` runs the command in a shell inside the new workspace.
-    # We then rename so the sidebar tab is human-readable.
     proc = subprocess.run(
-        ["cmux", "new-workspace", "--command", command],
+        ["cmux", "identify", "--no-caller"],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        sys.exit(f"spawn-cmux: cmux new-workspace failed:\n{proc.stderr.strip()}")
-    # Best-effort parse — cmux output format may vary. Try JSON first, then look for workspace:N.
-    ref = ""
+        sys.exit(f"spawn-cmux: cmux identify failed:\n{proc.stderr.strip()}")
     try:
         data = json.loads(proc.stdout)
-        ref = data.get("workspace") or data.get("ref") or ""
+        pane = data.get("focused", {}).get("pane_ref", "")
     except (json.JSONDecodeError, ValueError):
-        m = re.search(r"workspace:\d+", proc.stdout)
-        if m:
-            ref = m.group(0)
-    if not ref:
-        # Workspace was created but we can't reference it programmatically.
-        # The user can still see it; just warn.
-        print(
-            f"spawn-cmux: warn — could not parse workspace ref from cmux output for '{name}'. "
-            f"You can still see the tab in the sidebar.",
-            file=sys.stderr,
+        pane = ""
+    if not pane:
+        sys.exit("spawn-cmux: cmux identify did not return a focused pane_ref.")
+    return pane
+
+
+def cmux_new_terminal_tab(command: str, name: str, pane: str) -> str:
+    """Create a new terminal tab (surface) in the given pane, send `command`
+    + Enter to execute it, and rename the tab so the sidebar shows `name`.
+    Returns the new surface ref.
+
+    Pattern: `cmux new-surface --type terminal --pane <pane>` returns
+    "OK surface:N pane:M workspace:K"; we parse out surface:N. Then
+    `cmux send <text>` types the command, `cmux send-key Enter` executes
+    it, and `cmux rename-tab` updates the tab title.
+    """
+    proc = subprocess.run(
+        ["cmux", "new-surface", "--type", "terminal", "--pane", pane],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"spawn-cmux: cmux new-surface failed:\n{proc.stderr.strip()}")
+    m = re.search(r"surface:\d+", proc.stdout)
+    if not m:
+        sys.exit(
+            f"spawn-cmux: could not parse surface ref from cmux output: {proc.stdout!r}"
         )
-    else:
-        # Rename so the sidebar shows "<tag>:<name>" instead of the cwd.
-        subprocess.run(
-            ["cmux", "rename-workspace", "--workspace", ref, name],
-            capture_output=True,
-        )
+    ref = m.group(0)
+
+    # The new terminal needs a moment to spin up its shell before it can
+    # accept keystrokes. 0.5s empirically reliable on M-series Macs;
+    # longer is safe but slows fanout.
+    time.sleep(0.5)
+
+    subprocess.run(
+        ["cmux", "send", "--surface", ref, command],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["cmux", "send-key", "--surface", ref, "Enter"],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["cmux", "rename-tab", "--surface", ref, name],
+        capture_output=True,
+    )
     return ref
 
 
-def cmux_close_workspace(ref: str) -> None:
+def cmux_close_surface(ref: str) -> None:
     if not ref:
         return
     subprocess.run(
-        ["cmux", "close-workspace", "--workspace", ref],
+        ["cmux", "close-surface", "--surface", ref],
         capture_output=True,
     )
 
@@ -221,8 +248,11 @@ def spawn_one(
     model: str,
     repo_root: Path,
     session_tag: str,
+    pane_ref: str,
 ) -> dict:
-    """Fork JSONL → place in target project dir → launch cmux workspace."""
+    """Fork JSONL → place in target project dir → launch terminal tab in
+    the orchestrator's pane and start `claude --resume <uuid>` inside it.
+    """
     fork_uuid = str(uuid.uuid4())
     branch = ""
     if mode == "worktree":
@@ -238,24 +268,26 @@ def spawn_one(
     target_jsonl = target_proj_dir / f"{fork_uuid}.jsonl"
     shutil.copy2(parent_jsonl, target_jsonl)
 
-    # Build the command cmux will run in the new workspace.
-    # Note: `--resume <uuid>` resolves against the cwd's project dir, which we just populated.
+    # Build the shell command we'll send to the new terminal tab.
+    # `--resume <uuid>` resolves against the cwd's project dir we just populated.
     cd_part = f"cd {shell_quote(str(target_cwd))}"
     claude_part = (
         f"claude --resume {fork_uuid} --model {shell_quote(model)} "
-        f"--permission-mode acceptEdits "  # forks need to actually edit; remove for stricter mode
+        f"--dangerously-skip-permissions "
         f"{shell_quote(prompt)}"
     )
     full = f"{cd_part} && {claude_part}"
 
-    workspace_ref = cmux_new_workspace(full, name=f"{session_tag}:{task_name}")
+    surface_ref = cmux_new_terminal_tab(
+        full, name=f"{session_tag}:{task_name}", pane=pane_ref
+    )
 
     return {
         "task_name": task_name,
         "uuid": fork_uuid,
         "cwd": str(target_cwd),
         "branch": branch,
-        "workspace_ref": workspace_ref,
+        "surface_ref": surface_ref,
         "jsonl_path": str(target_jsonl),
     }
 
@@ -295,8 +327,14 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     tasks = [parse_task(t) for t in args.task]
     print(f"spawn-cmux: {len(tasks)} task(s), mode={args.mode}, model={args.model}", file=sys.stderr)
 
+    pane_ref = cmux_current_pane()
+    print(f"spawn-cmux: tabs will land in pane {pane_ref}", file=sys.stderr)
+
     spawns: list[dict] = []
-    for name, prompt in tasks:
+    for i, (name, prompt) in enumerate(tasks):
+        if i > 0 and args.stagger > 0:
+            print(f"spawn-cmux: sleeping {args.stagger}s before next spawn", file=sys.stderr)
+            time.sleep(args.stagger)
         info = spawn_one(
             parent_jsonl=parent_jsonl,
             cwd=cwd,
@@ -306,11 +344,12 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             model=args.model,
             repo_root=repo_root,
             session_tag=args.session_tag,
+            pane_ref=pane_ref,
         )
         spawns.append(info)
         print(
             f"  spawned {name:<24} uuid={info['uuid'][:8]} "
-            f"workspace={info['workspace_ref'] or '?'} cwd={info['cwd']}",
+            f"surface={info['surface_ref'] or '?'} cwd={info['cwd']}",
             file=sys.stderr,
         )
 
@@ -365,10 +404,22 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             except OSError as e:
                 print(f"  warn: could not remove {jp}: {e}", file=sys.stderr)
 
-        # Close the cmux workspace.
-        if s.get("workspace_ref"):
-            cmux_close_workspace(s["workspace_ref"])
-            print(f"  closed cmux workspace: {s['workspace_ref']}", file=sys.stderr)
+        # Close the cmux terminal tab. Tolerate the legacy workspace_ref
+        # field too in case a manifest from an older script run is being
+        # cleaned up.
+        ref = s.get("surface_ref") or s.get("workspace_ref")
+        if ref:
+            if ref.startswith("surface:"):
+                cmux_close_surface(ref)
+                print(f"  closed cmux tab: {ref}", file=sys.stderr)
+            else:
+                # Legacy: this manifest was written by an older script
+                # version that created workspaces. Close as workspace.
+                subprocess.run(
+                    ["cmux", "close-workspace", "--workspace", ref],
+                    capture_output=True,
+                )
+                print(f"  closed cmux workspace: {ref}", file=sys.stderr)
 
         # Optionally remove the worktree.
         if args.remove_worktrees and repo_root and s.get("cwd"):
@@ -420,6 +471,12 @@ def main() -> int:
     ap.add_argument(
         "--model", default="opus",
         help="Model alias passed to claude --model. Default: opus.",
+    )
+    ap.add_argument(
+        "--stagger", type=float, default=0.0, metavar="SECS",
+        help="Sleep this many seconds between successive spawns. Useful when the "
+             "Anthropic API rate-limits bursts of fork start-ups, or when the user "
+             "wants visual cadence in the cmux sidebar.",
     )
 
     # Cleanup flags.
