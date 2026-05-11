@@ -1,6 +1,6 @@
 ---
 name: skill-postmortem
-description: "Use when an existing user-level Claude Code skill has misbehaved during real use, or when a skill should be reviewed against actual session evidence before being shared more widely. Invoke as `skill-postmortem` (no namespace prefix)."
+description: "Use when a skill has misbehaved during real use, when session evidence should be reviewed before a skill is shared more widely, or when you want a structured friction analysis of an existing skill. Triggers: 'postmortem on <skill>', 'review <skill> against sessions', 'skill keeps failing'."
 ---
 
 # skill-postmortem
@@ -44,6 +44,8 @@ Read the 30 most recent matches. For each, extract the **conversation slice** ar
 Skip noise:
 - Sessions where the skill name appears only in the skill list and was never invoked
 - Sessions abandoned with `/clear` and no actionable signal
+
+If all matches are listing-only (the skill name appears in the system-injected skill list but was never actually fired), stop here: "No real invocations found for `<skill>` — postmortem requires at least 2–3 actual uses. Come back after more sessions."
 
 State up front: "Found N sessions invoking `<skill>`, taking M most recent for analysis."
 
@@ -99,7 +101,9 @@ Show all proposed edits as one block. Ask: "Apply edits 1, 3, 5? Skip 2 and 4? P
 Per approved edit:
 
 1. Apply diff with the `Edit` tool
-2. Run any verification the skill supports (typecheck, `python3 -m py_compile`, etc.)
+2. Run any verification the skill supports:
+   - Bundled scripts: `python3 -m py_compile scripts/*.py`
+   - SKILL.md edits: re-read the edited section and confirm the instruction is unambiguous — `py_compile` doesn't apply to markdown; the test is whether a fresh agent reading only that section would behave correctly
 3. Stage the change
 
 After all approved edits land, one commit per category:
@@ -139,12 +143,9 @@ If the source dir isn't a git repo (preflight #2 warned), surface the diffs as t
 
 Before declaring the postmortem done:
 
-- [ ] Identified target skill and resolved its source directory
-- [ ] Found N sessions of evidence (state N)
-- [ ] Categorized every friction signal across A–H
-- [ ] Confidence-ranked each
-- [ ] Proposed only high-confidence edits with quoted evidence
-- [ ] Got explicit user approval before applying
-- [ ] Verified scripts compile / typecheck where applicable
-- [ ] Committed per category, with evidence cited in the message
-- [ ] Pushed
+- [ ] **Preflight** — target skill resolves, git repo, projects dir present
+- [ ] **Phase 1** — N real invocations found (not just listing hits); stated up front
+- [ ] **Phase 2** — every friction signal categorized A–H
+- [ ] **Phase 3** — confidence band assigned to each; counts stated
+- [ ] **Phase 4** — high-confidence edits have quoted evidence; medium phrased as questions
+- [ ] **Phase 5** — user approval obtained before applying; scripts verified; one commit per category; pushed
