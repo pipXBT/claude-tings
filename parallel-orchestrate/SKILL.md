@@ -5,7 +5,7 @@ description: "Use when a design document, implementation plan, or feature spec c
 
 # parallel-orchestrate
 
-Decompose a design document into independent work units, run one Claude Opus agent per unit in its own cmux workspace tab and git worktree, then reconcile the parallel output in the orchestrator session.
+Decompose a design document into independent work units, run one agent per unit in its own cmux workspace tab and git worktree, then reconcile the parallel output in the orchestrator session. Each agent is assigned the model that matches its task complexity — Opus for open-ended reasoning, Sonnet for well-specified mechanical work, Haiku for pure analysis or read-only tasks.
 
 ## When to use
 
@@ -26,7 +26,10 @@ Abort with a clear message if any check fails. Do not continue with degraded beh
 
 1. **cmux detected** — `[ -n "$CMUX_WORKSPACE_ID" ]`
 2. **claude CLI on PATH** — `command -v claude`
-3. **Git repo with clean worktree** — `git status --porcelain` empty (warn on uncommitted changes; worktrees branch from current HEAD)
+3. **Git repo with a prepared HEAD** — Run `git status --porcelain`. Handle both types of dirty state before fanout:
+   - **Modified tracked files** (`M` prefix): stash with `git stash push -m "WIP before parallel fanout"` or commit. Worktrees branch from HEAD, so these changes are invisible to agents until you do this.
+   - **Untracked new source files** (`??` prefix): `git stash` does NOT capture these. Either use `git stash -u` (stash including untracked) or `git add <files> && git commit` as a pre-fanout substrate commit. Any file an agent imports or depends on must be in HEAD before fanout.
+   - Untracked non-source files (build artifacts, logs, CSVs) can stay — worktrees don't inherit them and agents rarely need them.
 4. **Not on `main`/`master`/`trunk`/`develop` without consent** — confirm explicitly before branching from a protected branch
 5. **Parent session JSONL exists** — `ls ~/.claude/projects/<encoded-cwd>/*.jsonl` returns at least one substantive file
 
@@ -57,18 +60,40 @@ If anything non-trivial: stop and raise to the user before fanout. Bad specs amp
 
 ## Phase 2 — Plan
 
-Group work items into agent tasks. Show the plan and get explicit confirmation before spawning. Format:
+Group work items into agent tasks. For each task, score its complexity and assign a model before showing the plan.
+
+### Complexity scoring
+
+Score each task across four dimensions. Total score determines the model.
+
+| Dimension | 1 pt — Mechanical | 2 pts — Moderate | 3 pts — Complex |
+|-----------|-------------------|------------------|-----------------|
+| **Instruction clarity** | Exact steps given (line numbers, code snippets) | Steps outlined, some judgment needed | Open-ended; agent must decide approach |
+| **Reasoning depth** | Pure search-replace / delete / rename | Needs to understand context to proceed | Tradeoffs to weigh; no single right answer |
+| **Spec completeness** | Every edge case covered | Gaps exist but are inferable | Significant gaps; agent must design |
+| **Verification** | Pass/fail (tests green, lint clean) | Multi-step checks with judgment calls | Hard to verify; relies on agent's own assessment |
+
+**Score → Model:**
+- **4–5 pts → Haiku** — read-only analysis, pure reporting, trivial deletes with zero judgment needed
+- **6–8 pts → Sonnet** — well-specified implementation, mechanical refactors, tasks where "done" is unambiguous
+- **9–12 pts → Opus** — architectural decisions, open-ended analysis, tasks with spec gaps the agent must fill, anything where a wrong call is hard to reverse
+
+When in doubt between two tiers, score the **uncertainty** rather than the task surface area — a large-but-mechanical task is still Sonnet.
+
+Show the plan and get explicit confirmation before spawning. Format:
 
 ```
 Wave 1 (parallel, N agents):
-  agent-01 [name: feat-payments]
+  agent-01 [name: feat-payments, model: sonnet, score: 7]
     items: 3, 5, 7
     files: src/payments/**, tests/payments/**
+    score: clarity=2, reasoning=2, spec=2, verify=1 → 7 → sonnet
     mandate: "Implement payment-flow per spec §3.2..."
 
-  agent-02 [name: feat-notifications]
+  agent-02 [name: feat-notifications, model: opus, score: 10]
     items: 4, 8
     files: src/notify/**, tests/notify/**
+    score: clarity=3, reasoning=3, spec=2, verify=2 → 10 → opus
     mandate: "..."
 
 Wave 2 (sequential, after Wave 1 reconciles):
@@ -102,16 +127,37 @@ Pre-work happens here because every fork inherits this session's JSONL. Things d
 
 ## Phase 4 — Fanout
 
-Run the spawn script:
+Run the spawn script. Always pass `--parent` with your current session UUID — active repos with many prior sessions have larger historical JSONLs and the default largest-file heuristic will pick the wrong one.
 
+Find your current session UUID: `ls -lt ~/.claude/projects/<encoded-cwd>/*.jsonl | head -1`
+
+**Single model (all agents same tier):**
 ```bash
 python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
   --mode worktree \
-  --model opus \
+  --model sonnet \
   --session-tag <session-tag> \
-  --task "feat-payments:Implement payment flow per spec §3.2. Files in scope: src/payments/**, tests/payments/**. Write report to .tmp/parallel-orchestrate/<session-tag>/reports/feat-payments.md and run 'cmux notify --title agent-done --body feat-payments'." \
+  --parent <current-session-uuid> \
+  --stagger 3 \
+  --task "feat-payments:Implement payment flow per spec §3.2..." \
   --task "feat-notifications:..."
 ```
+
+**Mixed models (agents on different tiers):** `--model` is global to one script invocation, so use two calls — one per model tier. Order doesn't matter; all worktrees branch from the same HEAD:
+```bash
+# Opus agents
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
+  --mode worktree --model opus --session-tag <tag> --parent <uuid> --stagger 3 \
+  --task "feat-arch:..."
+
+# Sonnet agents (separate invocation, same session-tag)
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
+  --mode worktree --model sonnet --session-tag <tag> --parent <uuid> --stagger 3 \
+  --task "feat-payments:..." \
+  --task "feat-notifications:..."
+```
+
+**Path note:** if your repo path contains underscores (e.g. `my_project`), the script may compute the wrong project directory. Verify: `ls ~/.claude/projects/ | grep <repo-name>`. If the real dir uses dashes where you see underscores, either pass `--parent <uuid>` (which bypasses the directory lookup entirely) or create a symlink: `ln -s ~/.claude/projects/<dash-version> ~/.claude/projects/<underscore-version>`.
 
 Per task, the script:
 
@@ -200,3 +246,6 @@ Clear the orchestrator status when fully done: `cmux clear-status orchestrate`.
 | Let an agent guess past a missing dep or unclear spec | Each mandate includes explicit stop-and-report-partial criteria |
 | Spawn 8 Opus agents simultaneously | Start with 3-agent waves before going to 6; Opus quota burns fast at 8× |
 | Skim recon and start spawning fast | Recon depth determines fork quality. Two-paragraph recon → forks ask basic questions on turn 1. Thorough recon → forks start writing code |
+| Assign Opus to every agent by default | Score each task first. Mechanical tasks with explicit instructions are Sonnet. Pure read/report tasks are Haiku. Reserve Opus for tasks with real reasoning demand or spec gaps. |
+| Stash before fanout without checking `??` lines | `git stash` skips untracked files. New source files won't appear in worktrees. Use `git stash -u` or commit them as a substrate commit first. |
+| Omit `--parent` when spawning | Active repos have many large historical JSONLs. Without `--parent`, the script picks the largest file — usually a past session, not the live one. Forks inherit the wrong context. |
