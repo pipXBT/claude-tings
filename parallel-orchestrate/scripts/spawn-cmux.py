@@ -8,9 +8,11 @@ running `claude --resume <uuid> -p` and capturing stdout, each fork is launched 
 
 Task format supports per-task model override:
     name:prompt                 — uses --model (default)
-    name:opus:prompt            — always opus for this task
-    name:sonnet:prompt          — always sonnet for this task
+    name:opus:prompt            — always opus (standard variant) for this task
+    name:sonnet:prompt          — always sonnet (standard variant) for this task
     name:haiku:prompt           — always haiku for this task
+    name:opus-1m:prompt         — always Opus 4.7 1M-context variant for this task
+    name:sonnet-1m:prompt       — always Sonnet 4.6 1M-context variant for this task
 
 Usage:
     spawn-cmux.py --session-tag <tag> --task "name:prompt" --task "name:prompt" ...
@@ -97,16 +99,36 @@ def session_dir(cwd: Path, tag: str) -> Path:
     return d
 
 
-_VALID_MODELS = {"opus", "sonnet", "haiku"}
+# Short alias → value passed to `claude --model`. Long-context (1M)
+# variants need the explicit model ID; the bare aliases route to whatever
+# the host claude binary defaults to (typically the standard variant).
+# Add new aliases here when Anthropic ships new model families.
+_MODEL_ALIASES = {
+    "opus": "opus",
+    "sonnet": "sonnet",
+    "haiku": "haiku",
+    "opus-1m": "claude-opus-4-7[1m]",
+    "sonnet-1m": "claude-sonnet-4-6[1m]",
+}
+_VALID_MODELS = set(_MODEL_ALIASES.keys())
+
+
+def resolve_model(alias: str) -> str:
+    """Map a CLI-friendly alias to the value passed to `claude --model`.
+
+    Unknown values pass through unchanged so power users can supply full
+    Anthropic model IDs verbatim (e.g. `--model claude-haiku-4-5-20251001`).
+    """
+    return _MODEL_ALIASES.get(alias, alias)
 
 
 def parse_task(raw: str, default_model: str) -> tuple[str, str, str]:
     """Split 'name:prompt' or 'name:model:prompt' on colons.
 
     Returns (name, model, prompt).  If the second token is a recognised model
-    alias (opus / sonnet / haiku) it is consumed as the per-task model override;
-    otherwise the default_model is used and the second token is treated as the
-    start of the prompt.
+    alias (opus / sonnet / haiku / opus-1m / sonnet-1m) it is consumed as
+    the per-task model override; otherwise the default_model is used and
+    the second token is treated as the start of the prompt.
     """
     if ":" not in raw:
         sys.exit(f"spawn-cmux: --task must be 'name:prompt' or 'name:model:prompt', got: {raw[:40]}…")
@@ -307,7 +329,7 @@ def spawn_one(
     sanitized_prompt = prompt.replace("\n", " ").replace("\r", " ")
     cd_part = f"cd {shell_quote(str(target_cwd))}"
     claude_part = (
-        f"claude --resume {fork_uuid} --model {shell_quote(model)} "
+        f"claude --resume {fork_uuid} --model {shell_quote(resolve_model(model))} "
         f"--dangerously-skip-permissions "
         f"{shell_quote(sanitized_prompt)}"
     )
@@ -511,7 +533,7 @@ def main() -> int:
     ap.add_argument(
         "--task", action="append", default=[],
         help="One per fork. Format: 'name:prompt' or 'name:model:prompt' where model is "
-             "opus/sonnet/haiku. Per-task model overrides --model. Repeatable.",
+             "opus/sonnet/haiku/opus-1m/sonnet-1m. Per-task model overrides --model. Repeatable.",
     )
     ap.add_argument(
         "--mode", choices=["worktree", "shared", "dry-run"], default="worktree",
@@ -519,7 +541,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--model", default="opus",
-        help="Model alias passed to claude --model. Default: opus.",
+        help="Model alias passed to claude --model. Accepts opus, sonnet, haiku, "
+             "opus-1m (= claude-opus-4-7[1m]), sonnet-1m (= claude-sonnet-4-6[1m]); "
+             "unknown values pass through verbatim. Default: opus.",
     )
     ap.add_argument(
         "--parent", default=None, metavar="UUID",
