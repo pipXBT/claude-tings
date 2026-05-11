@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""spawn-cmux — fork the current Claude session and launch one Opus agent per task
+"""spawn-cmux — fork the current Claude session and launch one agent per task
 in its own cmux workspace tab, optionally inside its own git worktree.
 
 Borrows the JSONL-snapshot trick from STRML/cc-skills/bin/cc-fork, but instead of
 running `claude --resume <uuid> -p` and capturing stdout, each fork is launched as
-`cmux new-workspace --command "cd <wt> && claude --resume <uuid> --model opus '<prompt>'"`
-so it appears as a vertical sidebar tab the user can watch.
+`cmux new-surface --type terminal --workspace <ws>` so it appears as a sidebar tab.
+
+Task format supports per-task model override:
+    name:prompt                 — uses --model (default)
+    name:opus:prompt            — always opus for this task
+    name:sonnet:prompt          — always sonnet for this task
+    name:haiku:prompt           — always haiku for this task
 
 Usage:
     spawn-cmux.py --session-tag <tag> --task "name:prompt" --task "name:prompt" ...
-    spawn-cmux.py --session-tag <tag> --mode {worktree,shared,dry-run} --model opus
+    spawn-cmux.py --session-tag <tag> --mode {worktree,shared,dry-run} --model sonnet
     spawn-cmux.py --session-tag <tag> --cleanup [--remove-worktrees]
 
 Modes:
@@ -41,8 +46,9 @@ from pathlib import Path
 
 
 def encode_project_path(p: Path) -> str:
-    """Claude Code encodes the project path by replacing /, ., and space with -."""
-    return re.sub(r"[/. ]", "-", str(p.resolve()))
+    """Claude Code encodes the project path by replacing all non-alphanumeric
+    characters (including underscores) with dashes."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(p.resolve()))
 
 
 def claude_project_dir(cwd: Path) -> Path:
@@ -91,21 +97,39 @@ def session_dir(cwd: Path, tag: str) -> Path:
     return d
 
 
-def parse_task(raw: str) -> tuple[str, str]:
-    """Split 'name:prompt' on the first colon. Validate name shape."""
+_VALID_MODELS = {"opus", "sonnet", "haiku"}
+
+
+def parse_task(raw: str, default_model: str) -> tuple[str, str, str]:
+    """Split 'name:prompt' or 'name:model:prompt' on colons.
+
+    Returns (name, model, prompt).  If the second token is a recognised model
+    alias (opus / sonnet / haiku) it is consumed as the per-task model override;
+    otherwise the default_model is used and the second token is treated as the
+    start of the prompt.
+    """
     if ":" not in raw:
-        sys.exit(f"spawn-cmux: --task must be 'name:prompt', got: {raw[:40]}…")
-    name, prompt = raw.split(":", 1)
-    name = name.strip()
-    prompt = prompt.strip()
+        sys.exit(f"spawn-cmux: --task must be 'name:prompt' or 'name:model:prompt', got: {raw[:40]}…")
+    parts = raw.split(":", 2)
+    name = parts[0].strip()
+
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,40}", name):
         sys.exit(
             f"spawn-cmux: task name '{name}' must be lowercase alnum + - / _, ≤41 chars. "
             f"It becomes a git branch and a worktree dir."
         )
+
+    # Detect optional per-task model token.
+    if len(parts) >= 3 and parts[1].strip().lower() in _VALID_MODELS:
+        model = parts[1].strip().lower()
+        prompt = parts[2].strip()
+    else:
+        model = default_model
+        prompt = ":".join(parts[1:]).strip()
+
     if not prompt:
         sys.exit(f"spawn-cmux: task '{name}' has empty prompt.")
-    return name, prompt
+    return name, model, prompt
 
 
 # --------------------------------------------------------------------- worktree
@@ -158,10 +182,10 @@ def list_worktrees(repo_root: Path) -> list[dict]:
 # ------------------------------------------------------------------------ cmux
 
 
-def cmux_current_pane() -> str:
-    """Return the orchestrator's current pane ref via `cmux identify`.
-    Each spawned terminal tab is added to this pane so the user sees them
-    as new tabs alongside the orchestrator, not in a separate workspace.
+def cmux_current_workspace() -> str:
+    """Return the orchestrator's current workspace ref via `cmux identify`.
+    New terminal tabs are added to this workspace so they appear alongside
+    the orchestrator tab in the sidebar.
     """
     proc = subprocess.run(
         ["cmux", "identify", "--no-caller"],
@@ -171,26 +195,33 @@ def cmux_current_pane() -> str:
         sys.exit(f"spawn-cmux: cmux identify failed:\n{proc.stderr.strip()}")
     try:
         data = json.loads(proc.stdout)
-        pane = data.get("focused", {}).get("pane_ref", "")
+        ws = data.get("focused", {}).get("workspace_ref", "")
     except (json.JSONDecodeError, ValueError):
-        pane = ""
-    if not pane:
-        sys.exit("spawn-cmux: cmux identify did not return a focused pane_ref.")
-    return pane
+        ws = ""
+    if not ws:
+        sys.exit("spawn-cmux: cmux identify did not return a focused workspace_ref.")
+    return ws
+
+
+# Keep the old name as an alias so external callers aren't broken.
+cmux_current_pane = cmux_current_workspace
 
 
 def cmux_new_terminal_tab(command: str, name: str, pane: str) -> str:
-    """Create a new terminal tab (surface) in the given pane, send `command`
-    + Enter to execute it, and rename the tab so the sidebar shows `name`.
-    Returns the new surface ref.
+    """Create a new terminal tab (surface) in the given workspace, send
+    `command` + Enter to execute it, and rename the tab so the sidebar
+    shows `name`.  Returns the new surface ref.
 
-    Pattern: `cmux new-surface --type terminal --pane <pane>` returns
-    "OK surface:N pane:M workspace:K"; we parse out surface:N. Then
-    `cmux send <text>` types the command, `cmux send-key Enter` executes
-    it, and `cmux rename-tab` updates the tab title.
+    `pane` is accepted for backwards compatibility but is ignored — cmux
+    new-surface uses --workspace instead, which is more reliable than
+    --pane on newer cmux versions.
+
+    Pattern: `cmux new-surface --type terminal --workspace <ws>` returns
+    "OK surface:N pane:M workspace:K"; we parse out surface:N.
     """
+    ws = cmux_current_workspace()
     proc = subprocess.run(
-        ["cmux", "new-surface", "--type", "terminal", "--pane", pane],
+        ["cmux", "new-surface", "--type", "terminal", "--workspace", ws],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -284,6 +315,7 @@ def spawn_one(
 
     return {
         "task_name": task_name,
+        "model": model,
         "uuid": fork_uuid,
         "cwd": str(target_cwd),
         "branch": branch,
@@ -309,7 +341,15 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     else:
         repo_root = cwd
 
-    parent_jsonl = find_parent_jsonl(claude_project_dir(cwd))
+    if args.parent:
+        proj_dir = claude_project_dir(cwd)
+        parent_jsonl = proj_dir / f"{args.parent}.jsonl"
+        if not parent_jsonl.exists():
+            sys.exit(
+                f"spawn-cmux: --parent {args.parent}: no such JSONL at {parent_jsonl}"
+            )
+    else:
+        parent_jsonl = find_parent_jsonl(claude_project_dir(cwd))
     print(
         f"spawn-cmux: parent session = {parent_jsonl.name} "
         f"({parent_jsonl.stat().st_size // 1024}K)",
@@ -324,14 +364,18 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             f"Run --cleanup or pick a different --session-tag."
         )
 
-    tasks = [parse_task(t) for t in args.task]
-    print(f"spawn-cmux: {len(tasks)} task(s), mode={args.mode}, model={args.model}", file=sys.stderr)
+    tasks = [parse_task(t, args.model) for t in args.task]
+    model_summary = ", ".join(f"{n}={m}" for n, m, _ in tasks)
+    print(
+        f"spawn-cmux: {len(tasks)} task(s), mode={args.mode}, models=[{model_summary}]",
+        file=sys.stderr,
+    )
 
     pane_ref = cmux_current_pane()
     print(f"spawn-cmux: tabs will land in pane {pane_ref}", file=sys.stderr)
 
     spawns: list[dict] = []
-    for i, (name, prompt) in enumerate(tasks):
+    for i, (name, model, prompt) in enumerate(tasks):
         if i > 0 and args.stagger > 0:
             print(f"spawn-cmux: sleeping {args.stagger}s before next spawn", file=sys.stderr)
             time.sleep(args.stagger)
@@ -341,14 +385,14 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             task_name=name,
             prompt=prompt,
             mode=args.mode,
-            model=args.model,
+            model=model,
             repo_root=repo_root,
             session_tag=args.session_tag,
             pane_ref=pane_ref,
         )
         spawns.append(info)
         print(
-            f"  spawned {name:<24} uuid={info['uuid'][:8]} "
+            f"  spawned {name:<24} model={model:<8} uuid={info['uuid'][:8]} "
             f"surface={info['surface_ref'] or '?'} cwd={info['cwd']}",
             file=sys.stderr,
         )
@@ -462,7 +506,8 @@ def main() -> int:
     # Flat flags — no subcommand. Default action is spawn; --cleanup switches to teardown.
     ap.add_argument(
         "--task", action="append", default=[],
-        help="One per fork. Format: 'name:prompt'. Repeatable.",
+        help="One per fork. Format: 'name:prompt' or 'name:model:prompt' where model is "
+             "opus/sonnet/haiku. Per-task model overrides --model. Repeatable.",
     )
     ap.add_argument(
         "--mode", choices=["worktree", "shared", "dry-run"], default="worktree",
@@ -471,6 +516,11 @@ def main() -> int:
     ap.add_argument(
         "--model", default="opus",
         help="Model alias passed to claude --model. Default: opus.",
+    )
+    ap.add_argument(
+        "--parent", default=None, metavar="UUID",
+        help="UUID of the specific session JSONL to use as the fork parent. "
+             "Bypasses the largest-file heuristic. Pass just the UUID (without .jsonl).",
     )
     ap.add_argument(
         "--stagger", type=float, default=0.0, metavar="SECS",
