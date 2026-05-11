@@ -301,11 +301,15 @@ def spawn_one(
 
     # Build the shell command we'll send to the new terminal tab.
     # `--resume <uuid>` resolves against the cwd's project dir we just populated.
+    # Newlines in the prompt would fire as Enter keypresses when cmux sends the
+    # text, splitting the command. Replace them with spaces — the prompt is a
+    # single CLI argument and whitespace is equivalent for Claude's parser.
+    sanitized_prompt = prompt.replace("\n", " ").replace("\r", " ")
     cd_part = f"cd {shell_quote(str(target_cwd))}"
     claude_part = (
         f"claude --resume {fork_uuid} --model {shell_quote(model)} "
         f"--dangerously-skip-permissions "
-        f"{shell_quote(prompt)}"
+        f"{shell_quote(sanitized_prompt)}"
     )
     full = f"{cd_part} && {claude_part}"
 
