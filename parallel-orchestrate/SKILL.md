@@ -1,47 +1,55 @@
 ---
 name: parallel-orchestrate
-description: "Use when a design document, implementation plan, or feature spec contains multiple independent work units that can be implemented simultaneously by different agents — and the orchestrator session is running inside a cmux terminal. Invoke as `parallel-orchestrate` (no namespace prefix)."
+description: "Use when a design document, implementation plan, or feature spec contains multiple independent features that can be implemented simultaneously by different agents. Spawns one agent per feature in its own git worktree on a feature/<name> branch, with a file-mailbox so agents can DM each other and the orchestrator. Terminal-agnostic (iTerm2, Terminal.app, tmux, plain SSH — no multiplexer required). Invoke as `parallel-orchestrate`."
 ---
 
 # parallel-orchestrate
 
-Decompose a design document into independent work units, run one agent per unit in its own cmux workspace tab and git worktree, then reconcile the parallel output in the orchestrator session. Each agent is assigned the model that matches its task complexity — Opus for open-ended reasoning, Sonnet for well-specified mechanical work, Haiku for pure analysis or read-only tasks.
+Decompose a design document into one **feature per agent**, then for each feature spawn:
+
+- a git worktree on a fresh `feature/<name>` branch (CodeRabbit-friendly; other PR-review skills work unchanged)
+- a JSONL-forked `claude --resume <uuid> -p` subprocess that inherits the orchestrator's recon as live conversation context
+- a file mailbox so agents can DM each other and the orchestrator while running
+
+The **current session is the orchestrator** — it does recon, fans out, brokers cross-agent messages, then reconciles. No new terminal tabs, no multiplexer dependency: agents run as background processes in the orchestrator's environment, output goes to log files.
+
+**REQUIRED SUB-SKILL:** Invoke `karpathy-guidelines` before Phase 1 and keep it active for the whole run. Each spawned agent's prompt also begins by invoking `karpathy-guidelines` — discipline propagates to every fork (see Phase 4).
 
 ## When to use
 
-- Design doc with 3+ work items that don't share files
+- Design doc with 3+ features that don't share files
+- Each feature wants its own PR / branch for CodeRabbit, ultrareview, or other branch-scoped review
 - Long task that would otherwise occupy one session for an hour or more
-- Currently inside a cmux terminal session
 
 ## When NOT to use
 
 - Single linear task or task that fits in one file
-- Not running inside cmux (the visibility-as-tabs benefit goes away)
-- Codebase has heavy dynamic wiring (Rails autoload, Django signals, WordPress hooks)
+- Codebase has heavy dynamic wiring (Rails autoload, Django signals, WordPress hooks) — single-author awareness needed
 - Spec is half-baked — fanout amplifies bad specs
+- You want the agents to literally see each other's terminal output (use a multiplexer + separate sessions for that; this skill assumes async file-based coordination)
 
 ## Preflight
 
 Abort with a clear message if any check fails. Do not continue with degraded behaviour.
 
-1. **cmux detected** — `[ -n "$CMUX_WORKSPACE_ID" ]`
-2. **claude CLI on PATH** — `command -v claude`
-3. **Git repo with a prepared HEAD** — Run `git status --porcelain`. Handle both types of dirty state before fanout:
-   - **Modified tracked files** (`M` prefix): stash with `git stash push -m "WIP before parallel fanout"` or commit. Worktrees branch from HEAD, so these changes are invisible to agents until you do this.
-   - **Untracked new source files** (`??` prefix): `git stash` does NOT capture these. Either use `git stash -u` (stash including untracked) or `git add <files> && git commit` as a pre-fanout substrate commit. Any file an agent imports or depends on must be in HEAD before fanout.
-   - Untracked non-source files (build artifacts, logs, CSVs) can stay — worktrees don't inherit them and agents rarely need them.
-4. **Not on `main`/`master`/`trunk`/`develop` without consent** — confirm explicitly before branching from a protected branch
-5. **Parent session JSONL exists** — `ls ~/.claude/projects/<encoded-cwd>/*.jsonl` returns at least one substantive file
+1. **`claude` CLI on PATH** — `command -v claude`
+2. **Inside a git repo with a prepared HEAD** — Run `git status --porcelain`. Handle both types of dirty state before fanout:
+   - **Modified tracked files** (`M`): stash with `git stash push -m "WIP before parallel fanout"` or commit. Worktrees branch from HEAD, so these changes are invisible to agents until you do this.
+   - **Untracked new source files** (`??`): `git stash` does NOT capture these. Either use `git stash -u` (stash including untracked) or `git add <files> && git commit` as a pre-fanout substrate commit. Any file an agent imports must be in HEAD before fanout.
+   - Untracked non-source files (build artifacts, logs, CSVs) can stay.
+3. **Not on `main`/`master`/`trunk`/`develop` without consent** — confirm explicitly before branching from a protected branch.
+4. **Parent session JSONL exists** — `ls ~/.claude/projects/<encoded-cwd>/*.jsonl` returns at least one substantive file. You will pass this session's UUID as `--parent`.
+5. **No conflicting feature branches** — for each planned task name, verify `git rev-parse --verify --quiet refs/heads/feature/<name>` returns non-zero. If a branch already exists, rename the task or delete the branch first.
 
 ## Phase 1 — Recon
 
 Read the document. State recon out loud in this conversation — every sentence becomes inherited context for every fork via JSONL fork. Cover, in this order:
 
 1. **What is being built** — one paragraph in your own words
-2. **Work items** — numbered, each with files touched and what "done" looks like
-3. **Dependency graph** — what blocks what; items with no upstream deps are wave-1 candidates
+2. **Features** — numbered, each with files touched and what "done" looks like (one feature = one agent = one branch)
+3. **Dependency graph** — what blocks what; features with no upstream deps are wave-1 candidates
 4. **Shared substrate** — types, migrations, dependencies every agent will need (becomes pre-work)
-5. **Conflict surface** — files multiple items want
+5. **Inter-feature contracts** — APIs / events / shared types where agents will need to coordinate via mailbox
 6. **Out of scope** — what the doc explicitly defers
 
 Run `tree -L 3 -I 'node_modules|dist|build|target|.venv|__pycache__'`. Capture the project's typecheck/test/lint commands into the conversation.
@@ -60,11 +68,9 @@ If anything non-trivial: stop and raise to the user before fanout. Bad specs amp
 
 ## Phase 2 — Plan
 
-Group work items into agent tasks. For each task, score its complexity and assign a model before showing the plan.
+One feature per agent. For each, score complexity and assign a model before showing the plan.
 
 ### Complexity scoring
-
-Score each task across four dimensions. Total score determines the model.
 
 | Dimension | 1 pt — Mechanical | 2 pts — Moderate | 3 pts — Complex |
 |-----------|-------------------|------------------|-----------------|
@@ -76,25 +82,25 @@ Score each task across four dimensions. Total score determines the model.
 **Score → Model:**
 - **4–5 pts → Haiku** — read-only analysis, pure reporting, trivial deletes with zero judgment needed
 - **6–8 pts → Sonnet** — well-specified implementation, mechanical refactors, tasks where "done" is unambiguous
-- **9–12 pts → Opus** — architectural decisions, open-ended analysis, tasks with spec gaps the agent must fill, anything where a wrong call is hard to reverse
+- **9–12 pts → Opus** — architectural decisions, open-ended analysis, tasks with spec gaps the agent must fill
 
-When in doubt between two tiers, score the **uncertainty** rather than the task surface area — a large-but-mechanical task is still Sonnet.
+When in doubt between two tiers, score the **uncertainty** rather than the task surface area.
 
 Show the plan and get explicit confirmation before spawning. Format:
 
 ```
-Wave 1 (parallel, N agents):
-  agent-01 [name: feat-payments, model: sonnet, score: 7]
-    items: 3, 5, 7
-    files: src/payments/**, tests/payments/**
-    score: clarity=2, reasoning=2, spec=2, verify=1 → 7 → sonnet
-    mandate: "Implement payment-flow per spec §3.2..."
+Wave 1 (parallel, N agents on feature branches):
+  agent feature/payments [model: sonnet, score: 7]
+    scope: src/payments/**, tests/payments/**
+    score: clarity=2 reasoning=2 spec=2 verify=1 → 7 → sonnet
+    mandate: "Implement payment flow per spec §3.2..."
+    may message: feature/notifications (for OrderEvent contract)
 
-  agent-02 [name: feat-notifications, model: opus, score: 10]
-    items: 4, 8
-    files: src/notify/**, tests/notify/**
-    score: clarity=3, reasoning=3, spec=2, verify=2 → 10 → opus
+  agent feature/notifications [model: opus, score: 10]
+    scope: src/notify/**, tests/notify/**
+    score: clarity=3 reasoning=3 spec=2 verify=2 → 10 → opus
     mandate: "..."
+    may message: feature/payments
 
 Wave 2 (sequential, after Wave 1 reconciles):
   - Integration tests across payments + notifications
@@ -106,136 +112,132 @@ Pre-work (this session, before any fanout):
 
 Rules for grouping:
 
-- **No two agents in the same wave touch the same file** — the central constraint
+- **One feature per agent** — that's the whole point of branch-per-agent. If two work items truly share a single feature, they're one agent.
+- **No two agents in the same wave touch the same file** — the central constraint; mailbox coordination is for *interface contracts*, not shared edits
 - **3–6 agents per wave** — fewer isn't worth orchestration overhead, more saturates Opus quota and makes reconcile painful
-- **30–90 minutes of work per agent** — smaller and Opus startup tax dominates; larger and one-tab-per-task visibility breaks
+- **30–90 minutes of work per agent**
 - **Tests next to code** — agent that writes a feature also writes its unit tests; cross-feature integration tests go in a later wave
 
-Choose mode (default: `worktree`):
+Mode (default: `worktree`):
 
-- **`worktree`** — each agent in its own `git worktree`, branched from current HEAD. Reconcile = merge. Required for any fanout that edits the same files.
-- **`shared`** — all agents in the current tree, file-ownership boundaries. Faster reconcile, but one misbehaving agent corrupts the tree.
-- **`dry-run`** — agents propose patches as text reports; nothing applied until reconcile reviews.
+- **`worktree`** — each agent in `git worktree add -b feature/<name>`, branched from HEAD. Reconcile = merge per branch. This is what makes CodeRabbit / ultrareview / per-feature PRs work.
+- **`shared`** — no worktree, no branch. All agents in the orchestrator tree. Use only when you genuinely want one combined PR and trust the file-ownership boundaries.
 
-Wait for explicit confirmation ("yes", "go", "spawn") before continuing. If the user wants changes, edit the plan and re-confirm.
+Wait for explicit confirmation ("yes", "go", "spawn") before continuing.
 
 ## Phase 3 — Pre-work
 
-Land shared-substrate items from recon §4 in this session before fanning out. Run typecheck/tests after — green is the baseline every fork branches from. Commit as a single tidy commit: `chore(orchestrate): pre-fanout substrate for <feature>`.
+Land shared-substrate items from recon §4 in this session before fanning out. Run typecheck/tests after — green is the baseline every fork branches from. Commit as a single tidy commit: `chore(orchestrate): pre-fanout substrate for <feature-set>`.
 
 Pre-work happens here because every fork inherits this session's JSONL. Things done here are visible to every agent without re-explanation. Things done after the fork point are not.
 
 ## Phase 4 — Fanout
 
-Run the spawn script. Always pass `--parent` with your current session UUID — active repos with many prior sessions have larger historical JSONLs and the default largest-file heuristic will pick the wrong one.
+Find your current session UUID — this becomes `--parent`:
 
-Find your current session UUID: `ls -lt ~/.claude/projects/<encoded-cwd>/*.jsonl | head -1`
-
-**Single model (all agents same tier):**
 ```bash
-python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
-  --mode worktree \
+ls -lt ~/.claude/projects/$(pwd | sed 's|[^a-zA-Z0-9]|-|g')/*.jsonl | head -1
+```
+
+Run the spawn script. `--parent` is **required** — the orchestrator must explicitly designate which session is the fork parent (active repos have many large historical JSONLs; auto-picking the largest is wrong often enough to disallow).
+
+**Single model:**
+```bash
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> \
+  --parent <orchestrator-session-uuid> \
   --model sonnet \
-  --session-tag <session-tag> \
-  --parent <current-session-uuid> \
-  --stagger 3 \
-  --task "feat-payments:Implement payment flow per spec §3.2..." \
-  --task "feat-notifications:..."
+  --stagger 2 \
+  --task "payments:Implement payment flow per spec §3.2..." \
+  --task "notifications:..."
 ```
 
-**Mixed models (agents on different tiers):** `--model` is global to one script invocation, so use two calls — one per model tier. Order doesn't matter; all worktrees branch from the same HEAD:
+**Mixed models (per-task override):**
 ```bash
-# Opus agents
-python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
-  --mode worktree --model opus --session-tag <tag> --parent <uuid> --stagger 3 \
-  --task "feat-arch:..."
-
-# Sonnet agents (separate invocation, same session-tag)
-python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
-  --mode worktree --model sonnet --session-tag <tag> --parent <uuid> --stagger 3 \
-  --task "feat-payments:..." \
-  --task "feat-notifications:..."
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --parent <uuid> --stagger 2 \
+  --task "payments:sonnet:Implement payment flow..." \
+  --task "platform-arch:opus:Design event bus..." \
+  --task "audit-report:haiku:Read all routes and produce a coverage matrix..."
 ```
-
-**Path note:** if your repo path contains underscores (e.g. `my_project`), the script may compute the wrong project directory. Verify: `ls ~/.claude/projects/ | grep <repo-name>`. If the real dir uses dashes where you see underscores, either pass `--parent <uuid>` (which bypasses the directory lookup entirely) or create a symlink: `ln -s ~/.claude/projects/<dash-version> ~/.claude/projects/<underscore-version>`.
 
 Per task, the script:
 
-1. Generates a UUID for the fork
-2. Creates a worktree at `<repo>/../<repo>-worktrees/<session-tag>/<task-name>` on a fresh branch `parallel/<session-tag>/<task-name>` (skipped if `--mode shared` or `--mode dry-run`)
-3. Copies the parent JSONL into the worktree's encoded project dir, so `claude --resume <uuid>` resolves
-4. Launches the fork as a cmux workspace tab
-5. Renames the workspace to `<session-tag>:<task-name>`
-6. Writes a manifest at `.tmp/parallel-orchestrate/<session-tag>/manifest.json`
+1. Verifies branch `feature/<task-name>` doesn't already exist; aborts if it does
+2. Creates worktree at `<repo>/../<repo>-worktrees/<task-name>` on branch `feature/<task-name>`
+3. Generates a UUID; copies the parent JSONL into the worktree's encoded project dir so `claude --resume <uuid>` resolves
+4. Sets up `mailbox/<task-name>/{inbox,seen,outbox}/`
+5. Launches `claude --resume <uuid> --model <m> --dangerously-skip-permissions -p <wrapped-prompt>` as a background subprocess; PID, stdout, stderr captured in `logs/`
+6. Writes manifest at `.tmp/parallel-orchestrate/<tag>/manifest.json`
 
-Each task prompt should follow this structure (forks inherit recon as conversation context, so prompts stay tight):
+The script wraps the user's mandate with: agent name, branch, worktree path, list of peer names, mailbox protocol, done-criteria, stop-and-report-partial criteria, and an explicit instruction to invoke `karpathy-guidelines` as the first action. **Keep mandate text tight** — the script handles the structural scaffold.
 
-```
-Mandate: <one sentence — what this agent owns>
-Scope: <files in bounds, e.g. "src/payments/**, tests/payments/**">
-Out of scope: <files NOT to touch, e.g. "src/notify/** is owned by another agent">
-Done when:
-  - <criterion 1, e.g. "all unit tests for payments pass">
-  - <criterion 2, e.g. "no new TypeScript errors in scope">
-  - <criterion 3, e.g. "report written">
+### Mailbox protocol (what every agent does)
 
-Stop and report partial — DO NOT GUESS — if any of:
-  - Missing dependency, undocumented API, or unclear instruction
-  - Verification fails three times despite different fixes
-  - Spec contradicts itself or contradicts existing code
-  - Need to touch a file outside scope to finish
+Every agent has a mailbox at `.tmp/parallel-orchestrate/<tag>/mailbox/<agent-name>/`:
 
-When done (or blocked):
-  1. Write report to .tmp/parallel-orchestrate/<session-tag>/reports/<task-name>.md
-     Sections: Mandate · What I did · What I skipped + why · Files touched · Tests run + result · Open questions · Follow-ups
-  2. Run: cmux notify --title agent-done --body <task-name>
-```
+- `inbox/` — messages addressed to this agent; agent polls with `ls inbox/` after every major step
+- `seen/` — agent moves processed messages here after reading
+- `outbox/` — audit copy of messages this agent sent
 
-## Phase 5 — Monitor
+To message a peer or the orchestrator, an agent writes a markdown file to `<mailbox-root>/<recipient>/inbox/<UTC-timestamp>-from-<sender>.md` and mirrors it into its own `outbox/`. The orchestrator has its own mailbox too (`mailbox/orchestrator/`) — agents address it as `orchestrator`.
 
-Stay in the orchestrator tab. Update progress so the sidebar reflects wave state:
+Use messages for genuine cross-agent need: interface contracts, blocking questions, "I'm changing the OrderEvent shape, here's the new TypeScript type." Don't use for status chatter — that's what reports are for.
+
+## Phase 5 — Monitor (fire-and-poll)
+
+The spawn script returns immediately. The orchestrator stays in this tab and polls:
 
 ```bash
-cmux set-status orchestrate "Wave 1 in flight" --icon hammer --color "#1565C0"
-cmux set-progress 0.0 --label "0/N done"
+# Quick status — alive procs, reports landed, inbox depth
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --status
+
+# Orchestrator's own inbox (cross-agent questions to broker)
+ls .tmp/parallel-orchestrate/<tag>/mailbox/orchestrator/inbox/
+
+# Live progress for a specific agent
+tail -n 50 .tmp/parallel-orchestrate/<tag>/logs/<agent>.out
 ```
 
-Watch `.tmp/parallel-orchestrate/<session-tag>/reports/` for new files. Update `set-progress` as each lands. Don't read agent surfaces obsessively — five-minute poll is fine. If a surface goes silent for 15+ minutes, `cmux read-screen --surface <ref> --lines 30` once and surface to user; don't auto-intervene.
+Cadence: every 3–5 minutes during active work. Read agent surfaces only when something looks stuck (no log growth for 10+ min, or PID dead with no report).
 
-When all N reports exist:
+**Brokering messages:** if an agent writes to `mailbox/orchestrator/inbox/`, read it, decide whether to:
+- Answer directly by writing to that agent's inbox (resolved → move the question to `mailbox/orchestrator/seen/`)
+- Forward to a peer (write to peer's inbox; cc both)
+- Escalate to the user
 
-```bash
-cmux set-progress 1.0 --label "Wave 1 complete, reconciling"
-cmux notify --title "Wave 1 done" --body "$N agents finished"
-```
+**Agent silence:** if an agent's PID is gone but no report exists, read the tail of its `.err` log. Common causes: model rate-limit, prompt mis-parse, JSONL not found in target project dir.
+
+Reports land at `.tmp/parallel-orchestrate/<tag>/reports/<agent>.md`. When all expected reports exist, advance to Phase 6.
 
 ## Phase 6 — Reconcile
 
 1. **Read every report in full.** No skim. Each report should declare: what was implemented, what was skipped + why, files touched, test status, follow-ups.
 2. **Surface findings inline for the user** — one paragraph per agent.
-3. **Worktree mode:** `git merge --no-ff parallel/<session-tag>/<task-name>` per agent in dependency order. Resolve conflicts. After each merge, run typecheck + tests. Revert that merge and ask the user if red.
+3. **Worktree mode (default):** for each agent in dependency order, `git merge --no-ff feature/<name>`. Resolve conflicts. After each merge, run typecheck + tests. Revert that merge and ask the user if red. Leave the worktrees on disk — `git worktree remove` happens in Phase 7.
+   - Alternative: push each `feature/<name>` branch and open a PR per agent (lets CodeRabbit / ultrareview run per branch). Skip the local merge if going PR-per-feature.
 4. **Shared mode:** run typecheck + tests. All agents already wrote to the same tree.
-5. **Dry-run mode:** review patches with the user. Apply approved, skip rest.
-6. **Commit per agent** with mandate as message: `feat(payments): <one-line>` plus a paragraph from the report.
-7. **Compile follow-ups** from every report into one TODO list for the next wave or a follow-up issue.
+5. **Commit per agent** (if merging locally) with mandate as message: `feat(payments): <one-line>` + a paragraph from the report.
+6. **Compile follow-ups** from every report into one TODO list for the next wave or a follow-up issue.
 
 ## Phase 7 — Cleanup
 
 ```bash
-python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-cmux.py \
-  --cleanup --session-tag <session-tag>
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --cleanup [--remove-worktrees] [--purge-session-dir]
 ```
 
-Removes forked JSONL files, closes agent workspaces in cmux, optionally removes worktrees with `--remove-worktrees`. Keep worktrees if you might want to inspect; they're cheap.
+Cleanup kills any lingering PIDs (SIGTERM, then SIGKILL after 0.5s), removes the forked JSONLs, optionally removes worktrees, optionally purges the session dir. Reports + mailbox + manifest stay by default so you can revisit a decision later.
 
-Clear the orchestrator status when fully done: `cmux clear-status orchestrate`.
+**Don't `--remove-worktrees` if PRs are open** against those branches — git worktree removal won't delete the branch, but you lose the on-disk working copy.
 
 ## Common mistakes
 
 | ❌ Wrong | ✅ Right |
 |---------|---------|
 | Skip critical review, fan out the moment you've decomposed | Read recon adversarially before fanout — gaps and contradictions raised to user first |
-| Two agents own overlapping files, "they'll figure it out" | Merge them into one agent or move one to wave 2; never overlap files in the same wave |
+| Two agents own overlapping files, "they'll figure it out via mailbox" | Mailbox is for interface contracts, not shared edits. Never overlap files in the same wave. |
 | Vague mandate: "improve the payments code" | Specific: "implement §3.2 in src/payments/**, tests passing, report at <path>" |
 | Bundle two concerns: "implement X and clean up Y" | One mandate per agent. Forks are cheap; spawn another for Y |
 | Tell every fork the full project background in its prompt | Recon happens once in the orchestrator; forks inherit via JSONL — keep prompts tight |
@@ -243,9 +245,10 @@ Clear the orchestrator status when fully done: `cmux clear-status orchestrate`.
 | Fan out 2 items because "it might save time" | 2 isn't worth ceremony — sequential is fine. 3+ before fanout |
 | Skim agent reports at reconcile | Read every report in full — reconcile is where the orchestrator earns its keep |
 | Merge an agent's branch and skip the test run | Run typecheck + tests after every merge; revert if red |
-| Let an agent guess past a missing dep or unclear spec | Each mandate includes explicit stop-and-report-partial criteria |
-| Spawn 8 Opus agents simultaneously | Start with 3-agent waves before going to 6; Opus quota burns fast at 8× |
-| Skim recon and start spawning fast | Recon depth determines fork quality. Two-paragraph recon → forks ask basic questions on turn 1. Thorough recon → forks start writing code |
-| Assign Opus to every agent by default | Score each task first. Mechanical tasks with explicit instructions are Sonnet. Pure read/report tasks are Haiku. Reserve Opus for tasks with real reasoning demand or spec gaps. |
-| Stash before fanout without checking `??` lines | `git stash` skips untracked files. New source files won't appear in worktrees. Use `git stash -u` or commit them as a substrate commit first. |
-| Omit `--parent` when spawning | Active repos have many large historical JSONLs. Without `--parent`, the script picks the largest file — usually a past session, not the live one. Forks inherit the wrong context. |
+| Let an agent guess past a missing dep or unclear spec | Each mandate includes explicit stop-and-report-partial criteria; agents message orchestrator before stopping |
+| Assign Opus to every agent by default | Score each task first. Mechanical tasks with explicit instructions are Sonnet. Pure read/report tasks are Haiku. |
+| Stash before fanout without checking `??` lines | `git stash` skips untracked files. New source files won't appear in worktrees. Use `git stash -u` or commit them first. |
+| Omit `--parent` when spawning | The script refuses to run without it — the orchestrator must explicitly designate the parent JSONL |
+| Forget the orchestrator has its own mailbox | Agents write to `mailbox/orchestrator/inbox/` when blocked. Poll it every monitor cycle. |
+| Reuse a session-tag for a second fanout while the first is still around | Pick a new tag, or `--cleanup` the old one first. The script refuses if the manifest exists. |
+| Spawn forks without propagating discipline | The script's wrapper already prepends `invoke karpathy-guidelines` to every prompt; verify it survives if you customize the wrapper |

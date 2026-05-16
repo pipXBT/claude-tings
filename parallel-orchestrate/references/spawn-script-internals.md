@@ -1,59 +1,85 @@
-# spawn-cmux.py internals
+# spawn-parallel.py internals
 
-Read this only when extending the script or debugging an unexpected behaviour. The SKILL.md gives you the public interface.
+Read this only when extending the script or debugging unexpected behaviour. SKILL.md gives you the public interface.
 
 ## What it does, in order
 
-1. **Preflight.** Verifies `CMUX_WORKSPACE_ID` is set, `cmux` and `claude` are on PATH, and (for worktree mode) the cwd is inside a git repo.
-2. **Locate parent JSONL.** Reads `~/.claude/projects/<encoded-cwd>/`. The encoded cwd is the absolute path with `/` and `.` replaced by `-`. Picks the largest .jsonl in that dir as the parent — sidecar files are tiny, the live conversation is huge.
+1. **Preflight.** Verifies `claude` (and `git`, in worktree mode) on PATH. Refuses to run without `--parent <uuid>` — the orchestrator must designate the parent JSONL explicitly. The largest-JSONL heuristic from cc-fork is intentionally disabled here because active repos accumulate many large historical sessions and auto-pick is wrong often enough to disallow.
+2. **Locate parent JSONL.** Reads `~/.claude/projects/<encoded-cwd>/<parent-uuid>.jsonl`. The encoded cwd replaces every non-alphanumeric character (including `_`, `/`, `.`) with `-`. Mismatch the encoding and the JSONL lands in a directory `claude --resume` will never look in.
 3. **Per task:**
+   - Validate the task name matches `[a-z0-9][a-z0-9_-]{0,40}` — it becomes both a git branch and a worktree dir.
+   - In `worktree` mode: check `feature/<task-name>` doesn't already exist (refuse rather than silently reuse), then `git worktree add -b feature/<task-name> <repo>/../<repo>-worktrees/<task-name>`.
    - Generate a v4 UUID for the fork.
-   - In worktree mode: `git worktree add -b parallel/<tag>/<name> <repo>/../<repo>-worktrees/<tag>/<name>`.
    - Compute the target cwd's encoded project dir (`~/.claude/projects/<encoded-target-cwd>/`) and `mkdir -p` it.
-   - Copy parent JSONL → `<encoded-target-cwd>/<uuid>.jsonl`. **This is the load-bearing step**: `claude --resume <uuid>` resolves against the *cwd of the launching shell*, not the parent's cwd. If the JSONL isn't in the new cwd's project dir, --resume fails with "session not found".
-   - Build a shell command: `cd <wt> && claude --resume <uuid> --model opus --dangerously-skip-permissions '<prompt>'`.
-   - `cmux new-workspace --command "<that command>"`.
-   - Parse the workspace ref from cmux output. If found, `cmux rename-workspace --workspace <ref> '<tag>:<name>'` so the sidebar tab is human-readable.
-4. **Manifest.** Write `.tmp/parallel-orchestrate/<tag>/manifest.json` listing every fork's UUID, target cwd, branch, workspace ref, and JSONL path. The cleanup pass and the orchestrator's monitoring read this.
-5. **Status.** Push a `cmux set-status orchestrate "<tag>: N agent(s) in flight"` so the orchestrator's own sidebar tab reflects state.
+   - Copy parent JSONL → `<encoded-target-cwd>/<uuid>.jsonl`. **This is the load-bearing step**: `claude --resume <uuid>` resolves against the cwd of the launching subprocess, not the orchestrator's cwd. The JSONL must be in the target cwd's project dir.
+   - Build the wrapped prompt (mandate + agent identity + scope + mailbox protocol + done/abort criteria + invoke-karpathy first action).
+   - `subprocess.Popen([claude, --resume, uuid, --model, m, --dangerously-skip-permissions, -p, prompt], cwd=worktree, stdout=log.out, stderr=log.err, stdin=DEVNULL, start_new_session=True)`. The `start_new_session=True` detaches the child from this script's process group so it survives after spawn-parallel exits — that's what makes fire-and-poll work.
+   - Write the PID to `logs/<task-name>.pid`.
+4. **Mailbox setup.** Creates `mailbox/<task-name>/{inbox,seen,outbox}/` for each agent and `mailbox/orchestrator/{inbox,seen,outbox}/` for the brokering hub.
+5. **Manifest.** Writes `.tmp/parallel-orchestrate/<tag>/manifest.json` listing every fork's UUID, target cwd, branch, PID, log paths, and JSONL path. Both `--status` and `--cleanup` read this.
 
 ## Cleanup
 
-`--cleanup --session-tag <tag>` reads the manifest and reverses each step: removes the forked JSONL files, closes the cmux workspaces, and (with `--remove-worktrees`) removes the worktrees. Reports stay by default — pass `--purge-session-dir` to wipe them too.
+`--cleanup --session-tag <tag>` reads the manifest and reverses each step:
+
+- Sends SIGTERM to each PID still alive, waits 0.5s, then SIGKILL if still up.
+- Removes the forked JSONL files.
+- With `--remove-worktrees`: `git worktree remove --force <path>` for each.
+- With `--purge-session-dir`: `rm -rf` the `.tmp/parallel-orchestrate/<tag>/` dir entirely (loses reports + mailbox + manifest).
+
+Reports + mailbox stay by default — the orchestrator may still need them for reconcile.
+
+## Status
+
+`--status --session-tag <tag>` prints a one-line-per-agent snapshot: PID, alive y/n, report landed y/n, inbox depth (unread messages), branch name. Also shows the orchestrator's own inbox depth. Cheap; safe to run on a /loop.
 
 ## Why permissions are `--dangerously-skip-permissions`
 
-Forks are non-interactive in the sense that the orchestrator can't easily approve every Edit/Write/Bash. Earlier versions used `--permission-mode acceptEdits`, but that still prompts for `Bash` and other non-edit tools (e.g., `pnpm install`, `git commit`, network fetches), which silently stalled agents that needed those primitives — the prompt fires inside the agent's cmux tab where nobody is watching to approve.
+Forks are non-interactive — they're background `claude -p` subprocesses with no terminal. Earlier prototypes used `--permission-mode acceptEdits`, but that still prompts for `Bash`, network fetches, and `git commit`. Those prompts fire into a stdout file no human is watching, and the agent silently stalls.
 
-`--dangerously-skip-permissions` removes ALL approval prompts so the agent can run end-to-end without intervention. This is acceptable in worktree mode because each fork's edits are isolated to a sibling working tree branched from a known substrate; the orchestrator inspects every commit at reconcile before merging. In `shared` mode the blast radius is wider — consider whether the agents' mandates are tight enough to justify it. In `dry-run` mode the agents shouldn't be executing anyway, so the flag is harmless.
+`--dangerously-skip-permissions` removes ALL approval prompts so the agent runs end-to-end without intervention. Acceptable in `worktree` mode because each fork's edits are isolated to a sibling working tree branched from a known substrate, and the orchestrator inspects every commit at reconcile before merging. In `shared` mode the blast radius is wider — only use shared mode when you've verified the per-agent file scopes don't overlap.
 
-If you want stricter permissions, edit the `claude_part` line in `spawn_one()` to use `--permission-mode acceptEdits` (file edits auto-approved, other tools prompt) or drop the flag entirely (everything prompts). Either way, the agent's tab needs human attention; the "set it and forget it" property is lost.
+If you want stricter permissions, edit the `cmd` list in `spawn_one()` — but understand that the "set it and forget it" property of fire-and-poll evaporates the moment any tool prompts a stdout file with no reader.
 
-## Why we do not use cc-fork directly
+## Relationship to cc-fork
 
-`cc-fork` (STRML/cc-skills) does the same JSONL snapshot, but launches each fork via `subprocess.run(claude --resume <uuid> -p "task")` — capturing stdout, no terminal. We need each fork visible as a cmux workspace tab so the user can watch progress and intervene. The launching mechanism is incompatible; the snapshotting trick is the same. If you have cc-fork installed, you can run it side-by-side for the headless cases.
+`cc-fork` (STRML/cc-skills) does the same JSONL snapshot, but:
+
+- Blocks until all forks complete (thread-joins them) — incompatible with fire-and-poll
+- Captures each fork's stdout as a returned string — fine for a quick fanout, useless for long-running feature work where the orchestrator wants to poll status mid-flight
+- Doesn't do worktrees or branches — every fork shares the orchestrator's cwd
+
+We borrow cc-fork's JSONL-copy trick verbatim. We replace the threaded `subprocess.run(... -p ...)` with detached `Popen(... -p ..., start_new_session=True)` so each agent outlives this script. The wrapper layers worktree+branch+mailbox on top.
+
+If you have cc-fork installed, it's still the right tool for short, headless, "give me N parallel opinions" tasks. spawn-parallel is the right tool for feature-scoped, branch-per-agent, "give me N concurrent feature implementations" tasks.
 
 ## Common failures and fixes
 
-**"no Claude session dir at …".** The orchestrator's cwd has never had a Claude session. Run `claude` once in this dir first.
+**`--parent <uuid>: no such JSONL at …`.** The UUID isn't a session in this cwd's project dir. List candidates: `ls -lt ~/.claude/projects/<encoded-cwd>/*.jsonl | head -5`.
 
-**"session not found" inside a fork.** The JSONL didn't land in the right project dir. Check the worktree path is what you expect, and that `~/.claude/projects/<encoded-worktree-path>/<uuid>.jsonl` exists. Encoded path: `/Users/x/repo-worktrees/tag/name` → `-Users-x-repo-worktrees-tag-name`.
+**`session not found` in an agent's stderr log.** The JSONL didn't land in the right project dir. Check that `~/.claude/projects/<encoded-worktree-path>/<uuid>.jsonl` exists. The encoding replaces every non-alphanumeric with `-`. Worktree `/Users/x/repo-worktrees/payments` → project dir `-Users-x-repo-worktrees-payments`.
 
-**Workspace ref empty in manifest.** The script couldn't parse cmux's output. The workspace was still created — visible in the sidebar — but cleanup won't be able to close it programmatically. You can `cmux list-workspaces` to find it and close it manually. Update the parsing in `cmux_new_workspace()` if cmux's output format changes.
+**`branch 'feature/<name>' already exists`.** Leftover from an aborted run, or you used the same task name twice. Either `git branch -D feature/<name>` or rename the task.
 
-**Worktree already exists.** Means a previous fanout with the same tag wasn't cleaned up. Run `--cleanup --remove-worktrees --session-tag <tag>`, or pick a new tag.
+**`worktree already exists at …`.** Same root cause. Run `--cleanup --remove-worktrees --session-tag <old-tag>`, or pick a new task name.
 
-**`git worktree add` fails with detached HEAD or pathspec.** The current HEAD probably has uncommitted changes that conflict, or the branch already exists. The script always creates a fresh branch (`-b parallel/...`); if that branch exists, it's leftover from an aborted run — `git branch -D parallel/<tag>/<name>` and retry.
+**Agent PID is gone but no report.** Tail `logs/<agent>.err`. Common causes: model rate-limit (visible in stderr), JSONL not in target project dir (`session not found`), prompt mis-parsed (shell-quoting issue if you've customized the wrapper).
 
 **Forks don't see parent context.** Verify the parent JSONL was actually copied:
 ```bash
 ls -la ~/.claude/projects/<encoded-target-cwd>/
 ```
-If empty, the encode step (replace `/` and `.` with `-`) probably differs between the script and Claude Code. Run `python3 -c "from pathlib import Path; import re; print(re.sub(r'[/.]', '-', str(Path('<your-target>').resolve())))"` and compare.
+If empty, your encoding doesn't match Claude Code's. Compare:
+```bash
+python3 -c "import re; from pathlib import Path; print(re.sub(r'[^a-zA-Z0-9]', '-', str(Path('<your-target>').resolve())))"
+```
+
+**Agent ignores its inbox.** The wrapper prompt instructs `ls inbox/` between steps, but the model may forget on long runs. Either tighten the wrapper (in `build_agent_prompt`) or send a "check your inbox now" message — the wrapper tells the agent to read its own inbox too, so the message will be picked up next poll.
 
 ## Extending
 
-- **Different model per agent.** Replace `--model` with a per-task override: parse `name:model:prompt` instead of `name:prompt`.
-- **Different cwd per agent (non-worktree).** Add a `--target-cwd` per task. The JSONL copy logic already handles arbitrary cwds.
-- **Initial input via stdin.** `claude --resume <uuid>` accepts a positional prompt; if you want the fork to start with a pre-loaded file context, pass `--print-and-loop` or use `cmux send` to type into the surface after launch.
-- **Wait for all forks before returning.** The script currently spawns and exits. To block, poll for report files in `.tmp/parallel-orchestrate/<tag>/reports/` or `cmux read-screen` each surface looking for an exit marker. A blocking flag `--wait-for-reports N` would be a small addition.
+- **Different branch prefix.** Use `--branch-prefix feat` or `--branch-prefix ""` (no prefix). Already supported.
+- **Different model per agent.** Already supported via `name:model:prompt` task format.
+- **Different cwd per agent (non-worktree).** Add a `--target-cwd` per task and a third (or fourth) colon segment to `parse_task`. The JSONL copy logic already handles arbitrary cwds.
+- **Blocking mode.** If you want spawn-parallel to wait for all reports before returning, add a `--wait-for-reports` flag that polls `reports/*.md` count and returns once it matches `len(tasks)`. The current fire-and-poll design assumes the orchestrator does this polling itself.
+- **Auto-broker.** A small daemon could watch `mailbox/orchestrator/inbox/` and forward obvious peer-to-peer messages without the orchestrator brokering manually. Add as a `--broker-daemon` background loop if message volume gets high.
