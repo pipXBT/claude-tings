@@ -1,31 +1,35 @@
 # parallel-orchestrate
 
-A Claude Code skill that decomposes a design document into independent work units, runs one Claude Opus agent per unit in its own cmux workspace tab and git worktree, and reconciles the parallel output in the orchestrator session. Each agent inherits the orchestrator's recon as live conversation context, so forks start writing code instead of re-deriving project background.
+A Claude Code skill that decomposes a design document into independent features and spawns one agent per feature. Each agent runs in its own git worktree on a `feature/<name>` branch, with a file-based mailbox so agents can DM each other and the orchestrator while running. The orchestrator (the session you invoke from) stays live, brokers cross-agent messages, and reconciles at the end.
+
+Terminal-agnostic: works in iTerm2, Terminal.app, tmux, plain SSH — no terminal multiplexer required. Agents run as background processes; output goes to log files.
 
 ## Why
 
-A design doc with five independent feature buckets is five tasks worth of context-switching for a single session. This skill turns that into one orchestrator session plus N parallel agents — each visible as a cmux tab, each in its own worktree, each starting with the same shared understanding of the spec. Reconcile happens once at the end, not constantly throughout.
+A design doc with five independent features is five tasks worth of context-switching for a single session. This skill turns that into one orchestrator session plus N background agents — each on its own feature branch (so CodeRabbit, ultrareview, and other branch-scoped review tools work unchanged), each starting with the orchestrator's recon as live conversation context. Reconcile happens once, per-branch, via merge or PR.
 
 ## When to use
 
-- Design doc with three or more work units that don't share files
+- Design doc with three or more features that don't share files
+- Each feature wants its own PR / branch for review tooling
 - Work big enough that a single session would otherwise context-switch for an hour
-- You're running inside a cmux terminal and want each agent's progress in its own tab
 
 ## When NOT to use
 
 - Single linear task or task that fits in one file
-- Codebase has heavy dynamic wiring (Rails autoload, Django signals, WordPress hooks) that needs single-author awareness
+- Codebase has heavy dynamic wiring (Rails autoload, Django signals, WordPress hooks) needing single-author awareness
 - Spec is half-baked — fanout amplifies bad specs; tighten the spec first
-- Not in cmux — the visibility-as-tabs benefit goes away
+- You expect agents to literally watch each other's terminal output — this skill uses async file mailboxes, not shared TTYs
 
 ## Requirements
 
-- macOS with [cmux](https://cmux.com) running (`brew install --cask cmux`)
 - `claude` CLI on PATH (Claude Code)
-- A git repo with a clean working tree (or willingness to commit before fanning out)
+- `git` on PATH (for the default `worktree` mode)
+- A git repo with a clean working tree (or willingness to commit/stash before fanning out)
 - An existing Claude Code session in the cwd (the skill forks its JSONL)
 - Python 3.8+
+
+No multiplexer required. Works in any terminal emulator.
 
 ## Install
 
@@ -44,39 +48,85 @@ cd ~/code/claude-tings && ./install.sh
 git clone https://github.com/pipXBT/claude-tings.git ~/code/claude-tings
 mkdir -p ~/.claude/skills
 ln -s ~/code/claude-tings/parallel-orchestrate ~/.claude/skills/parallel-orchestrate
-chmod +x ~/code/claude-tings/parallel-orchestrate/scripts/spawn-cmux.py
+chmod +x ~/code/claude-tings/parallel-orchestrate/scripts/spawn-parallel.py
 ```
 
 Restart your Claude Code session. Verify by asking `what skills do you have?` — `parallel-orchestrate` should appear.
 
-### Updating
-
-```bash
-cd ~/code/claude-tings
-git pull
-```
-
-Symlinks pick up changes automatically.
-
 ## Use
 
-Inside a Claude Code session running in cmux:
+Inside any Claude Code session:
 
 ```
 > Read docs/feature-x-spec.md and use parallel-orchestrate to implement it.
 ```
 
-Claude reads the doc, talks through the work in this session (recon), proposes a wave-1 split (which items go to which agents and what files each owns), asks you to confirm, lands any shared pre-work, then runs `scripts/spawn-cmux.py` to spawn one Opus agent per wave-1 task into its own cmux workspace tab.
+Claude reads the doc, talks through the work in this session (recon), proposes one agent per feature (which files each owns, which model fits, where inter-feature contracts live), asks you to confirm, lands any shared pre-work, then runs `scripts/spawn-parallel.py` to spawn one background agent per feature on its own `feature/<name>` branch.
 
-You watch the tabs fill in. Each agent ends by writing a report to `.tmp/parallel-orchestrate/<tag>/reports/<agent>.md` and pinging `cmux notify`. The orchestrator session reads every report, merges the worktree branches, runs your test suite, and commits per-agent.
+The orchestrator polls `.tmp/parallel-orchestrate/<tag>/` for reports and its own inbox, brokering cross-agent messages as they arrive. When all reports land, the orchestrator merges each branch (or pushes them as PRs), runs your test suite per merge, and commits per-agent.
+
+## Layout per fanout
+
+Everything lives under `.tmp/parallel-orchestrate/<session-tag>/`:
+
+```
+.tmp/parallel-orchestrate/<tag>/
+├── manifest.json                   # UUIDs, PIDs, branches, worktree paths
+├── reports/
+│   └── <agent>.md                  # final report per agent
+├── logs/
+│   ├── <agent>.out                 # stdout
+│   ├── <agent>.err                 # stderr
+│   └── <agent>.pid                 # pid file
+└── mailbox/
+    ├── orchestrator/{inbox,seen,outbox}/
+    └── <agent>/{inbox,seen,outbox}/
+```
+
+Worktrees live siblings to the repo at `<repo>/../<repo>-worktrees/<task-name>` on branch `feature/<task-name>`.
+
+## Mailbox protocol
+
+Each agent (and the orchestrator) has `mailbox/<name>/{inbox,seen,outbox}/`. To message a peer:
+
+```
+write  .tmp/parallel-orchestrate/<tag>/mailbox/<recipient>/inbox/<UTC>-from-<sender>.md
+mirror .tmp/parallel-orchestrate/<tag>/mailbox/<sender>/outbox/<UTC>-to-<recipient>.md
+```
+
+Recipient polls its `inbox/` between major work steps, moves processed messages to `seen/`. The orchestrator brokers — answering, forwarding, or escalating to the user.
+
+Use it for **interface contracts and blocking questions**, not status chatter. Reports cover status.
 
 ## Modes
 
 | Mode | Behaviour | When to pick |
 |------|-----------|--------------|
-| `worktree` (default) | Each agent in its own `git worktree`. Reconcile = `git merge`. | Any fanout where agents could touch overlapping files |
-| `shared` | All agents share the orchestrator's tree. Faster reconcile (no merge). | When file-ownership boundaries are strict and you trust them |
-| `dry-run` | No edits applied; agents propose patches in their reports. Reconcile reviews and applies the approved ones. | Fragile codebases or first-time use on a new repo |
+| `worktree` (default) | Each agent in its own `git worktree` on `feature/<task-name>`. Reconcile = `git merge` per branch or PR per branch. | Default. Anything where you want per-feature review or branch isolation. |
+| `shared` | All agents in the orchestrator tree; no branches, no worktrees. | Only when file-ownership is strict, you trust the boundaries, and want one combined PR. |
+
+## Inspect / monitor
+
+```bash
+# alive procs, reports landed, orchestrator inbox depth
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --status
+
+# tail a specific agent's log
+tail -f .tmp/parallel-orchestrate/<tag>/logs/<agent>.out
+
+# orchestrator's brokering queue
+ls .tmp/parallel-orchestrate/<tag>/mailbox/orchestrator/inbox/
+```
+
+## Cleanup
+
+```bash
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --cleanup [--remove-worktrees] [--purge-session-dir]
+```
+
+Kills any lingering PIDs (SIGTERM, then SIGKILL after 0.5s), removes forked JSONLs, optionally removes worktrees, optionally purges the session dir. Reports + mailbox stay by default.
 
 ## Layout
 
@@ -85,7 +135,7 @@ parallel-orchestrate/
 ├── SKILL.md                              # phases the orchestrator follows
 ├── README.md                             # this file
 ├── scripts/
-│   └── spawn-cmux.py                     # JSONL fork + worktree + cmux launch
+│   └── spawn-parallel.py                 # JSONL fork + worktree + bg subprocess
 └── references/
     └── spawn-script-internals.md         # debug + extend guide for the script
 ```
