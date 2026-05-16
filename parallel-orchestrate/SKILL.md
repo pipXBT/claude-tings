@@ -184,6 +184,21 @@ To message a peer or the orchestrator, an agent writes a markdown file to `<mail
 
 Use messages for genuine cross-agent need: interface contracts, blocking questions, "I'm changing the OrderEvent shape, here's the new TypeScript type." Don't use for status chatter — that's what reports are for.
 
+### CRITICAL: agents must NOT block on mailbox replies
+
+When an agent sends a blocking-decision MSG to the orchestrator, it MUST exit, not wait. `claude -p` has no event loop — the only ways to "pause" are emit-tokens-continuously (expensive) or bash `sleep` loops (no tokens → Anthropic API stream's idle timeout fires after ~5–10 min → `API Error: Stream idle timeout - partial response received` → process dies, WIP often unsaved).
+
+Observed failure (HyperShield Wave 2, 2026-05-16): PR-D agent sent a crypto-scheme sign-off MSG, polled mailbox in bash loop, died ~10 min later with the API stream timeout. WIP files survived in the worktree but no commits, no PR.
+
+Protocol after sending a blocking MSG:
+
+1. Write the MSG to `mailbox/orchestrator/inbox/<UTC-ts>-from-<agent>.md`
+2. Write a PARTIAL REPORT at `reports/<agent>.md` capturing WIP state + the question
+3. EXIT
+4. Orchestrator handles the decision, then spawns a CONTINUATION AGENT with the decision embedded in its prompt — see "Relaunching a dead agent" below.
+
+The continuation agent inherits the dead agent's JSONL (forked by copying to a new UUID in the same encoded-project-dir), so all prior context (including the MSG it sent) is preserved.
+
 ## Phase 5 — Monitor (event-stream)
 
 After fanout, run the watcher inside `Monitor`. Every state transition (report landed, message in orchestrator inbox, dead agent, silent log, all-done) lands as a notification in this session within ~2 seconds. No more cron-checking; reactions are deterministic instead of "did I remember to poll?".
@@ -229,6 +244,46 @@ Otherwise treat as **FYI** (auto-forward). **When in doubt, escalate** — over-
 ### Re-attach
 
 If you Ctrl+C the `Monitor` mid-fanout (or it errors), agents keep running. Re-attach with the same `--watch` command; snapshot replay re-emits any pending reports and inbox messages so you don't miss the events that landed while detached.
+
+### After a relaunch: ALL_DONE may fire spuriously
+
+The watcher's ALL_DONE heuristic is "report file present at each agent's `report_path`" — not "PID alive." After you relaunch an agent (see below), if the relaunched agent writes to a DIFFERENT report path (e.g., `<agent>-v2.md` instead of `<agent>.md`), the watcher reads the v1 report as "done" and fires ALL_DONE prematurely.
+
+Workarounds:
+1. **Overwrite the v1 report path in the relaunched agent's mandate.** Cleanest — the watcher correctly detects the new report.
+2. **Ignore the spurious ALL_DONE and poll manually** via `Bash run_in_background`:
+   ```bash
+   bash -c '
+   while kill -0 <NEW_PID> 2>/dev/null; do
+     [ -f "<NEW_REPORT_PATH>" ] && exit 0
+     sleep 30
+   done
+   '
+   ```
+
+### Relaunching a dead agent
+
+When an agent dies (DEAD event surfaced; user approves relaunch — never auto-relaunch), the script does not yet have a `--relaunch` flag, so the workflow is manual:
+
+1. Find the dead JSONL: `jq -r '.spawns[] | select(.task_name == "<agent>") | .jsonl_path' .tmp/parallel-orchestrate/<tag>/manifest.json`
+2. New UUID: `NEW_UUID=$(uuidgen | tr 'A-Z' 'a-z')`
+3. Fork the JSONL (preserves prior context including any MSGs the dead agent sent):
+   ```bash
+   cp <dead-jsonl> $(dirname <dead-jsonl>)/${NEW_UUID}.jsonl
+   ```
+4. cd to the worktree (so `claude --resume`'s encoded-cwd resolution finds the new JSONL).
+5. Launch detached, with `<continuation-prompt>` containing the decision/context the dead agent was waiting on:
+   ```bash
+   nohup claude --resume "$NEW_UUID" --model <m> --dangerously-skip-permissions \
+     -p "$(cat continuation-prompt.txt)" \
+     > .tmp/parallel-orchestrate/<tag>/logs/<agent>-r2.out \
+     2> .tmp/parallel-orchestrate/<tag>/logs/<agent>-r2.err \
+     < /dev/null &
+   NEW_PID=$!
+   ```
+6. Update `manifest.json` so Phase 7 cleanup correctly reaps the new process — swap `pid`, `uuid`, `jsonl_path`, `log_out`, `log_err`; save originals as `pid_original` etc.
+
+The continuation prompt MUST embed any decision the dead agent was waiting on — never make the relaunched agent re-enter the mailbox-wait state that killed its predecessor.
 
 ## Phase 6 — Reconcile
 
