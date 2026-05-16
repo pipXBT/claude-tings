@@ -588,6 +588,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 # if we previously flagged this and mtime hasn't advanced past the flag, skip
                 if name in silent_emitted and silent_emitted[name] >= mtime:
                     continue
+                # Cross-check: `claude` CLI block-buffers stdout when redirected
+                # to a non-TTY file (libc default for non-interactive streams).
+                # An agent actively editing files via Edit/Write can produce no
+                # log growth for `silent_min` minutes while making real progress
+                # in the worktree. Skip SILENT if the worktree has uncommitted
+                # changes — deterministic proof of agent activity.
+                # Observed 2026-05-16, HyperShield Wave 3: both agents triggered
+                # spurious SILENT at the 5-min mark while actively editing.
+                worktree = a.get("cwd")
+                if worktree and Path(worktree).is_dir():
+                    try:
+                        r = subprocess.run(
+                            ["git", "-C", worktree, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if r.returncode == 0 and r.stdout.strip():
+                            continue  # uncommitted changes → agent is working
+                    except (subprocess.SubprocessError, OSError):
+                        pass  # git unavailable → fall through and emit SILENT
                 emit("SILENT", name, payload=f"no_log_growth={age/60:.1f}m")
                 silent_emitted[name] = mtime
             elif name in silent_emitted and mtime > silent_emitted[name]:

@@ -229,8 +229,22 @@ For ad-hoc snapshots outside an active `--watch`, `--status` still works.
 | `MSG <agent>` (FYI) | safe | Read the file. If it's an informational notice ("I'm changing the OrderEvent shape, here's the new type"), forward to the named peer's inbox, mirror to `seen/`, summarise in conversation. |
 | `MSG <agent>` (decision) | escalate | Surface verbatim to user. Ask: "answer directly / forward to `<peer>` / pause this agent?" Do not write to mailboxes until user decides. |
 | `DEAD <agent>` | escalate | Surface the `last_err_tail` (exit code is always `?` because agents are detached subprocesses — the `.err` tail is the diagnostic). Ask: "write partial report manually / relaunch / abort?" Never auto-relaunch — rate-limits, prompt mis-parses, and JSONL mismatches each need different recovery. |
-| `SILENT <agent>` | escalate | Surface with suggested next step (`tail -n 50 .tmp/parallel-orchestrate/<tag>/logs/<agent>.out`, or send a ping to `mailbox/<agent>/inbox/`). Do NOT auto-poke — false positives during deep agent reasoning are real. |
+| `SILENT <agent>` | escalate | Cross-check before surfacing: `ps -p <pid>`, `git -C <worktree> status --porcelain`, `ls <session-dir>/reports/`. If PID is alive AND worktree shows uncommitted changes (`M` or `??`), it's almost certainly a `claude` stdout-buffering false positive — wait for the next event. Surface to user only if ALL three cross-checks show no activity. Do NOT auto-poke. See "SILENT false-positive pattern" below. |
 | `ALL_DONE` | safe | One-line summary, then transition to Phase 6 ("reading all `<n>` reports now"). |
+
+### SILENT false-positive pattern
+
+The `claude` CLI block-buffers stdout when redirected to a non-TTY file (libc default for non-interactive streams, ~4KB+ before flush). An agent actively editing files via Edit/Write can produce no log growth for `silent_min` minutes while making real progress in the worktree — watcher emits SILENT, agent is fine. Observed twice simultaneously in HyperShield Wave 3 (2026-05-16): both agents triggered SILENT at the 5-minute mark while actively editing files; `git -C <worktree> status --porcelain` immediately disproved the stall.
+
+The autonomy table's 3-step cross-check eliminates 100% of observed false positives:
+
+1. `ps -p <pid>` — process alive
+2. `git -C <worktree> status --porcelain` — uncommitted changes present (`M`/`??`)
+3. `ls <session-dir>/reports/` — no premature report
+
+If 1 + 2 are positive, ignore the SILENT and continue waiting. The watcher's `scan_silent()` (post-2026-05-16) also does this cross-check at source, so the event won't even emit when uncommitted changes exist — but the cross-check pattern remains the orchestrator's fallback if running against an older watcher.
+
+A clean wrapper fix (e.g., `stdbuf -oL claude ...`) isn't available: macOS doesn't ship `stdbuf` by default, and `claude` is a Mach-O native binary (not Node), so libc-layer buffering hints may not apply. Cross-check is the recommended pattern.
 
 ### Distinguishing FYI from decision MSGs
 
