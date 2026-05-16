@@ -83,3 +83,62 @@ python3 -c "import re; from pathlib import Path; print(re.sub(r'[^a-zA-Z0-9]', '
 - **Different cwd per agent (non-worktree).** Add a `--target-cwd` per task and a third (or fourth) colon segment to `parse_task`. The JSONL copy logic already handles arbitrary cwds.
 - **Blocking mode.** If you want spawn-parallel to wait for all reports before returning, add a `--wait-for-reports` flag that polls `reports/*.md` count and returns once it matches `len(tasks)`. The current fire-and-poll design assumes the orchestrator does this polling itself.
 - **Auto-broker.** A small daemon could watch `mailbox/orchestrator/inbox/` and forward obvious peer-to-peer messages without the orchestrator brokering manually. Add as a `--broker-daemon` background loop if message volume gets high.
+
+## `--watch` mode (event stream)
+
+`cmd_watch()` runs a polling loop (default 2 s) that emits one structured stdout
+line per state transition. Output is line-buffered (`flush=True`) so the
+orchestrator's `Monitor` tool can deliver each line as a notification.
+
+### State carried in-memory (lost on restart by design)
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `seen_reports` | `set[str]` | Agent names already REPORT-emitted; prevents duplicates |
+| `seen_msgs` | `set[str]` | Inbox filenames already MSG-emitted |
+| `dead_emitted` | `set[str]` | Agent names already DEAD-flagged |
+| `silent_emitted` | `dict[str, float]` | Agent → log mtime at the moment of flagging; if mtime advances past that value, the flag clears so a fresh stall can re-fire |
+| `alive_prev` | `dict[str, bool]` | Per-agent alive state from the previous iteration, used to detect alive→dead transitions |
+
+### Startup behaviour
+
+1. Emits `WATCH_START` with manifest path and agent count.
+2. Snapshot replay: scans `reports/` and `mailbox/orchestrator/inbox/` once;
+   emits `REPORT` / `MSG` for everything currently present. Makes Ctrl+C →
+   re-attach transparent.
+3. Enters poll loop.
+
+### Shutdown behaviour
+
+- `ALL_DONE` (all expected reports landed AND no alive PIDs) → emit terminal
+  event, exit 0. The orchestrator's `Monitor` returns; Phase 6 begins.
+- SIGTERM / SIGINT → exit 0 silently. Agents keep running. Re-attach with the
+  same `--watch` command and snapshot replay covers any state that landed while
+  the watcher was detached.
+
+### Known limitations
+
+- **No exit code in DEAD events.** Agents are launched detached, so the watcher
+  observes them only via PID liveness, not as child processes. DEAD payload uses
+  `exit=?` and relies on the `last_err_tail` (last 5 lines of `.err`) for
+  diagnosis. If exit code is essential for future workflows, switch to a
+  pidfd-based wait — but that needs Linux-only code paths and complicates the
+  cross-platform story.
+- **Zombie-process detection on macOS.** `os.kill(pid, 0)` succeeds for zombie
+  (defunct) processes until they're reaped, which would make alive→dead
+  transitions undetectable. `is_process_alive()` therefore also runs
+  `ps -p <pid> -o state=` and treats state `Z` as dead. Linux behaves the same
+  way; the `ps` fallback is portable.
+- **Filesystem polling, not fsevents/kqueue.** At the small file counts involved
+  (≤ ~10 agents × small inbox), `glob + stat` at 2 s intervals is cheap enough.
+  Switching to native fs-watching would add OS-specific code without measurable
+  benefit.
+
+### Environment variable
+
+- `PO_TMP_ROOT` — if set, the watcher resolves the session dir under this root
+  instead of `os.getcwd()`. Used exclusively by the test suite at
+  `parallel-orchestrate/tests/test_watch.py`. Production callers should not set
+  this. Note: `cmd_status()` and `cmd_cleanup()` currently still resolve their
+  session dir from `os.getcwd()` directly (not via the helper) — they don't
+  honour `PO_TMP_ROOT`. This is a pre-existing pattern, not in scope here.

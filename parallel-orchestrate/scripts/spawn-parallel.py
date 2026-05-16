@@ -69,7 +69,9 @@ def require(cmd: str) -> None:
 
 def session_dir(cwd: Path, tag: str) -> Path:
     """All per-fanout state lives under .tmp/parallel-orchestrate/<tag>/."""
-    d = cwd / ".tmp" / "parallel-orchestrate" / tag
+    # allow tests (and advanced users) to point the script at an arbitrary root
+    _root = Path(os.environ.get("PO_TMP_ROOT", str(cwd)))
+    d = _root / ".tmp" / "parallel-orchestrate" / tag
     (d / "reports").mkdir(parents=True, exist_ok=True)
     (d / "logs").mkdir(parents=True, exist_ok=True)
     (d / "mailbox").mkdir(parents=True, exist_ok=True)
@@ -408,11 +410,29 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
 
 def is_process_alive(pid: int) -> bool:
+    """Return True iff the process exists and is not a zombie (defunct).
+
+    On macOS (and other BSDs), kill(pid, 0) succeeds for zombie processes
+    because they still hold a PID slot. We additionally check the process
+    state via `ps` and treat state 'Z' (zombie/defunct) as dead so that
+    dead-agent detection works for processes that have exited but whose
+    parent hasn't reaped them yet.
+    """
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+    # pid exists — check whether it's a zombie (already exited, awaiting reap)
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state="],
+            capture_output=True, text=True, timeout=2,
+        )
+        state = result.stdout.strip()
+        return bool(state) and state[0] != "Z"
+    except Exception:
+        # if ps fails for any reason, fall back to assuming alive
+        return True
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
@@ -506,6 +526,133 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------ watch
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Stream structured event lines to stdout until ALL_DONE or signal."""
+    import signal as _signal
+
+    _root = Path(os.environ.get("PO_TMP_ROOT", os.getcwd()))
+    sess_dir = _root / ".tmp" / "parallel-orchestrate" / args.session_tag
+    manifest_path = sess_dir / "manifest.json"
+    if not manifest_path.is_file():
+        print(f"spawn-parallel: no manifest at {manifest_path}", file=sys.stderr)
+        return 1
+    manifest = json.loads(manifest_path.read_text())
+    agents = manifest.get("agents", [])
+
+    # graceful shutdown on SIGTERM/SIGINT — exit 0, agents keep running
+    _stop = {"flag": False}
+
+    def _handle(signum, frame):
+        _stop["flag"] = True
+    _signal.signal(_signal.SIGTERM, _handle)
+    _signal.signal(_signal.SIGINT, _handle)
+
+    def emit(kind: str, agent: str = "", payload: str = ""):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        line = f"[{ts}] {kind}" + (f" {agent}" if agent else "") + (f" {payload}" if payload else "")
+        print(line, flush=True)
+
+    emit("WATCH_START", payload=f"manifest={manifest_path} agents={len(agents)}")
+
+    poll_sec = args.poll_sec
+    seen_reports: set[str] = set()
+    seen_msgs: set[str] = set()
+    orch_inbox = sess_dir / "mailbox" / "orchestrator" / "inbox"
+
+    dead_emitted: set[str] = set()
+    alive_prev: dict[str, bool] = {
+        a["name"]: is_process_alive(a.get("pid", 0)) for a in agents
+    }
+
+    silent_emitted: dict[str, float] = {}  # agent -> mtime at flagging
+    silent_sec = args.silent_min * 60.0
+
+    def scan_silent():
+        for a in agents:
+            name = a["name"]
+            pid = a.get("pid", 0)
+            if not is_process_alive(pid):
+                continue  # silent only for alive agents
+            log_path = sess_dir / "logs" / f"{name}.out"
+            if not log_path.is_file():
+                continue
+            mtime = log_path.stat().st_mtime
+            age = time.time() - mtime
+            if age >= silent_sec:
+                # if we previously flagged this and mtime hasn't advanced past the flag, skip
+                if name in silent_emitted and silent_emitted[name] >= mtime:
+                    continue
+                emit("SILENT", name, payload=f"no_log_growth={age/60:.1f}m")
+                silent_emitted[name] = mtime
+            elif name in silent_emitted and mtime > silent_emitted[name]:
+                # log has advanced past the previous flag → clear so future stalls re-fire
+                del silent_emitted[name]
+
+    def scan_dead():
+        for a in agents:
+            name = a["name"]
+            pid = a.get("pid", 0)
+            if name in dead_emitted:
+                continue
+            alive_now = is_process_alive(pid)
+            if alive_prev.get(name, False) and not alive_now:
+                # transition alive → dead; check report presence at this moment
+                report_path = sess_dir / "reports" / f"{name}.md"
+                if not report_path.is_file():
+                    err_path = sess_dir / "logs" / f"{name}.err"
+                    err_tail = ""
+                    if err_path.is_file():
+                        tail_lines = err_path.read_text().splitlines()[-5:]
+                        err_tail = " | ".join(tail_lines).replace('"', "'")
+                    # exit code unknown from outside the process — use sentinel
+                    emit("DEAD", name, payload=f'exit=? last_err_tail="{err_tail}"')
+                    dead_emitted.add(name)
+            alive_prev[name] = alive_now
+
+    def scan_msgs():
+        if not orch_inbox.is_dir():
+            return
+        for p in sorted(orch_inbox.glob("*")):
+            if p.name in seen_msgs:
+                continue
+            # parse sender from filename pattern: <ts>-from-<sender>.md
+            m = re.search(r"from-([\w.-]+?)\.(?:md|txt)$", p.name)
+            sender = m.group(1) if m else "unknown"
+            emit("MSG", sender, payload=str(p))
+            seen_msgs.add(p.name)
+
+    # snapshot replay — emit for everything currently present, then begin loop
+    reports_dir = sess_dir / "reports"
+    if reports_dir.is_dir():
+        for p in sorted(reports_dir.glob("*.md")):
+            agent_name = p.stem
+            emit("REPORT", agent_name, payload=str(p))
+            seen_reports.add(agent_name)
+
+    scan_msgs()
+
+    while not _stop["flag"]:
+        if reports_dir.is_dir():
+            for p in sorted(reports_dir.glob("*.md")):
+                if p.stem not in seen_reports:
+                    emit("REPORT", p.stem, payload=str(p))
+                    seen_reports.add(p.stem)
+
+        scan_msgs()
+        scan_dead()
+        scan_silent()
+
+        any_alive = any(is_process_alive(a.get("pid", 0)) for a in agents)
+        if len(seen_reports) >= len(agents) and not any_alive:
+            emit("ALL_DONE", payload=f"reports={len(seen_reports)}/{len(agents)} alive=0")
+            return 0
+        time.sleep(poll_sec)
+    return 0
+
+
 # ----------------------------------------------------------------------- argparse
 
 
@@ -554,14 +701,24 @@ def main() -> int:
     ap.add_argument("--purge-session-dir", action="store_true",
                     help="With --cleanup: also delete .tmp/parallel-orchestrate/<tag>/ entirely.")
 
+    ap.add_argument("--watch", action="store_true",
+                    help="Stream structured event lines (REPORT/MSG/DEAD/SILENT/ALL_DONE) "
+                         "to stdout until fanout completes. Designed for the Monitor tool.")
+    ap.add_argument("--silent-min", type=float, default=5.0,
+                    help="Minutes of no-log-growth before emitting SILENT (default 5.0).")
+    ap.add_argument("--poll-sec", type=float, default=2.0,
+                    help="Poll interval in seconds (default 2.0).")
+
     args = ap.parse_args()
 
     if args.cleanup:
         return cmd_cleanup(args)
     if args.status:
         return cmd_status(args)
+    if args.watch:
+        return cmd_watch(args)
     if not args.task:
-        ap.error("one of --task (one or more), --status, or --cleanup is required")
+        ap.error("one of --task (one or more), --status, --cleanup, or --watch is required")
     return cmd_spawn(args)
 
 
