@@ -26,7 +26,9 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "spawn-parallel.py"
 def make_session_dir(tag: str, agents: list[dict]) -> Path:
     """Build a fake .tmp/parallel-orchestrate/<tag>/ tree matching the real layout.
 
-    agents = [{"name": "payments", "pid": 99999, "branch": "feature/payments"}, ...]
+    agents = [{"task_name": "payments", "pid": 99999, "branch": "feature/payments"}, ...]
+    Schema mirrors what cmd_spawn actually writes: manifest["spawns"] with per-spawn
+    key "task_name".
     """
     root = Path(tempfile.mkdtemp(prefix=f"po-test-{tag}-"))
     sess = root / ".tmp" / "parallel-orchestrate" / tag
@@ -35,14 +37,15 @@ def make_session_dir(tag: str, agents: list[dict]) -> Path:
     (sess / "mailbox" / "orchestrator" / "inbox").mkdir(parents=True)
     (sess / "mailbox" / "orchestrator" / "seen").mkdir()
     for a in agents:
+        name = a["task_name"]
         for sub in ("inbox", "seen", "outbox"):
-            (sess / "mailbox" / a["name"] / sub).mkdir(parents=True)
+            (sess / "mailbox" / name / sub).mkdir(parents=True)
         # empty log so SILENT detection has something to stat
-        (sess / "logs" / f"{a['name']}.out").write_text("")
-        (sess / "logs" / f"{a['name']}.err").write_text("")
+        (sess / "logs" / f"{name}.out").write_text("")
+        (sess / "logs" / f"{name}.err").write_text("")
     (sess / "manifest.json").write_text(json.dumps({
         "session_tag": tag,
-        "agents": agents,
+        "spawns": agents,
     }))
     return root  # caller will pass --tmp-root to point watcher at this
 
@@ -117,7 +120,7 @@ class TestWatchReport(unittest.TestCase):
     def test_existing_report_replayed_at_startup(self):
         """Reports present at watcher start emit REPORT during snapshot replay."""
         self.tmp_root = make_session_dir("rep1", agents=[
-            {"name": "payments", "pid": 99999, "branch": "feature/payments"}
+            {"task_name": "payments", "pid": 99999, "branch": "feature/payments"}
         ])
         sess = self.tmp_root / ".tmp" / "parallel-orchestrate" / "rep1"
         (sess / "reports" / "payments.md").write_text("done")
@@ -137,7 +140,7 @@ class TestWatchMsg(unittest.TestCase):
 
     def test_existing_msg_replayed_at_startup(self):
         self.tmp_root = make_session_dir("msg1", agents=[
-            {"name": "payments", "pid": 99999, "branch": "feature/payments"}
+            {"task_name": "payments", "pid": 99999, "branch": "feature/payments"}
         ])
         sess = self.tmp_root / ".tmp" / "parallel-orchestrate" / "msg1"
         # MUST also land a report so ALL_DONE triggers and watcher exits
@@ -159,12 +162,14 @@ class TestWatchDead(unittest.TestCase):
 
     def test_dead_agent_no_report_emits_dead(self):
         """An agent process that exits without writing a report → DEAD."""
-        # spawn a tiny subprocess that exits in 0.2s with non-zero status
+        # spawn a victim that stays alive long enough for the watcher to observe it alive,
+        # then exits with non-zero status; 3.0s gives the watcher time to start up even
+        # on slow runners (watcher timeout=4.0s gives 1s margin after victim exits)
         victim = subprocess.Popen(
-            [sys.executable, "-c", "import sys, time; time.sleep(1.0); sys.exit(1)"]
+            [sys.executable, "-c", "import sys, time; time.sleep(3.0); sys.exit(1)"]
         )
         self.tmp_root = make_session_dir("dead1", agents=[
-            {"name": "audit", "pid": victim.pid, "branch": "feature/audit"}
+            {"task_name": "audit", "pid": victim.pid, "branch": "feature/audit"}
         ])
         sess = self.tmp_root / ".tmp" / "parallel-orchestrate" / "dead1"
         (sess / "logs" / "audit.err").write_text(
@@ -193,7 +198,7 @@ class TestWatchSilent(unittest.TestCase):
         )
         try:
             self.tmp_root = make_session_dir("silent1", agents=[
-                {"name": "payments", "pid": victim.pid, "branch": "feature/payments"}
+                {"task_name": "payments", "pid": victim.pid, "branch": "feature/payments"}
             ])
             sess = self.tmp_root / ".tmp" / "parallel-orchestrate" / "silent1"
             # backdate the log mtime well past 0.01 min (= 0.6s)
@@ -224,7 +229,7 @@ class TestWatchSignal(unittest.TestCase):
         )
         try:
             self.tmp_root = make_session_dir("sig1", agents=[
-                {"name": "p", "pid": victim.pid, "branch": "feature/p"}
+                {"task_name": "p", "pid": victim.pid, "branch": "feature/p"}
             ])
             env = os.environ.copy()
             env["PO_TMP_ROOT"] = str(self.tmp_root)

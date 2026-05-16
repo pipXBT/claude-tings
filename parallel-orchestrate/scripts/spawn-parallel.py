@@ -540,7 +540,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"spawn-parallel: no manifest at {manifest_path}", file=sys.stderr)
         return 1
     manifest = json.loads(manifest_path.read_text())
-    agents = manifest.get("agents", [])
+    agents = manifest.get("spawns", [])
 
     # graceful shutdown on SIGTERM/SIGINT — exit 0, agents keep running
     _stop = {"flag": False}
@@ -564,17 +564,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     dead_emitted: set[str] = set()
     alive_prev: dict[str, bool] = {
-        a["name"]: is_process_alive(a.get("pid", 0)) for a in agents
+        a["task_name"]: is_process_alive(a.get("pid", 0)) for a in agents
     }
 
     silent_emitted: dict[str, float] = {}  # agent -> mtime at flagging
     silent_sec = args.silent_min * 60.0
 
-    def scan_silent():
+    def scan_silent(alive_now: dict[str, bool]):
         for a in agents:
-            name = a["name"]
-            pid = a.get("pid", 0)
-            if not is_process_alive(pid):
+            name = a["task_name"]
+            if not alive_now.get(name, False):
                 continue  # silent only for alive agents
             log_path = sess_dir / "logs" / f"{name}.out"
             if not log_path.is_file():
@@ -591,26 +590,26 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 # log has advanced past the previous flag → clear so future stalls re-fire
                 del silent_emitted[name]
 
-    def scan_dead():
+    def scan_dead(alive_now: dict[str, bool]):
         for a in agents:
-            name = a["name"]
+            name = a["task_name"]
             pid = a.get("pid", 0)
             if name in dead_emitted:
                 continue
-            alive_now = is_process_alive(pid)
-            if alive_prev.get(name, False) and not alive_now:
+            is_alive = alive_now.get(name, False)
+            if alive_prev.get(name, False) and not is_alive:
                 # transition alive → dead; check report presence at this moment
                 report_path = sess_dir / "reports" / f"{name}.md"
                 if not report_path.is_file():
                     err_path = sess_dir / "logs" / f"{name}.err"
                     err_tail = ""
                     if err_path.is_file():
-                        tail_lines = err_path.read_text().splitlines()[-5:]
+                        tail_lines = err_path.read_text(errors='replace').splitlines()[-5:]
                         err_tail = " | ".join(tail_lines).replace('"', "'")
                     # exit code unknown from outside the process — use sentinel
                     emit("DEAD", name, payload=f'exit=? last_err_tail="{err_tail}"')
                     dead_emitted.add(name)
-            alive_prev[name] = alive_now
+            alive_prev[name] = is_alive
 
     def scan_msgs():
         if not orch_inbox.is_dir():
@@ -642,10 +641,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     seen_reports.add(p.stem)
 
         scan_msgs()
-        scan_dead()
-        scan_silent()
 
-        any_alive = any(is_process_alive(a.get("pid", 0)) for a in agents)
+        # snapshot liveness once per poll cycle — avoids 3N ps subprocess calls
+        alive_now: dict[str, bool] = {
+            a["task_name"]: is_process_alive(a.get("pid", 0)) for a in agents
+        }
+        scan_dead(alive_now)
+        scan_silent(alive_now)
+
+        any_alive = any(alive_now.values())
         if len(seen_reports) >= len(agents) and not any_alive:
             emit("ALL_DONE", payload=f"reports={len(seen_reports)}/{len(agents)} alive=0")
             return 0
