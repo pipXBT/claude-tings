@@ -184,32 +184,51 @@ To message a peer or the orchestrator, an agent writes a markdown file to `<mail
 
 Use messages for genuine cross-agent need: interface contracts, blocking questions, "I'm changing the OrderEvent shape, here's the new TypeScript type." Don't use for status chatter — that's what reports are for.
 
-## Phase 5 — Monitor (fire-and-poll)
+## Phase 5 — Monitor (event-stream)
 
-The spawn script returns immediately. The orchestrator stays in this tab and polls:
+After fanout, run the watcher inside `Monitor`. Every state transition (report landed, message in orchestrator inbox, dead agent, silent log, all-done) lands as a notification in this session within ~2 seconds. No more cron-checking; reactions are deterministic instead of "did I remember to poll?".
 
-```bash
-# Quick status — alive procs, reports landed, inbox depth
-python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
-  --session-tag <tag> --status
-
-# Orchestrator's own inbox (cross-agent questions to broker)
-ls .tmp/parallel-orchestrate/<tag>/mailbox/orchestrator/inbox/
-
-# Live progress for a specific agent
-tail -n 50 .tmp/parallel-orchestrate/<tag>/logs/<agent>.out
+```
+Monitor({
+  description: "parallel-orchestrate watch for session <tag>",
+  command: "python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py --session-tag <tag> --watch --silent-min 5",
+  persistent: true,
+  timeout_ms: 3600000
+})
 ```
 
-Cadence: every 3–5 minutes during active work. Read agent surfaces only when something looks stuck (no log growth for 10+ min, or PID dead with no report).
+**`persistent: true` is required.** Without it, the default 5-minute timeout (or even the 1-hour max) would kill the watcher mid-fanout. `timeout_ms` is ignored when `persistent: true` but the schema requires it; pass `3600000`. Stop the watcher via `TaskStop` if you need to detach manually.
 
-**Brokering messages:** if an agent writes to `mailbox/orchestrator/inbox/`, read it, decide whether to:
-- Answer directly by writing to that agent's inbox (resolved → move the question to `mailbox/orchestrator/seen/`)
-- Forward to a peer (write to peer's inbox; cc both)
-- Escalate to the user
+Monitor runs the watcher as a background process — the orchestrator can issue other tool calls in parallel while events stream in. React per the autonomy reaction table below. When the watcher emits `ALL_DONE` and exits, Monitor reports the command's completion and the orchestrator advances to Phase 6.
 
-**Agent silence:** if an agent's PID is gone but no report exists, read the tail of its `.err` log. Common causes: model rate-limit, prompt mis-parse, JSONL not found in target project dir.
+If the watcher exits without emitting `ALL_DONE` (crashed or killed), do NOT auto-advance to Phase 6. Re-attach with the same `--watch` command — snapshot replay covers any state that landed while detached — and read the watcher's stderr (Monitor saves it to its output file) to diagnose the crash.
 
-Reports land at `.tmp/parallel-orchestrate/<tag>/reports/<agent>.md`. When all expected reports exist, advance to Phase 6.
+For ad-hoc snapshots outside an active `--watch`, `--status` still works.
+
+### Autonomy reaction table
+
+| Event | Auto-act? | Action |
+| --- | --- | --- |
+| `WATCH_START` | safe | One-line ack in conversation: "watching `<n>` agents, session=`<tag>`". |
+| `REPORT <agent>` | safe | Note in conversation: "agent `<agent>` finished, report at `<path>`". Do NOT read the report yet — Phase 6 reads them all. |
+| `MSG <agent>` (FYI) | safe | Read the file. If it's an informational notice ("I'm changing the OrderEvent shape, here's the new type"), forward to the named peer's inbox, mirror to `seen/`, summarise in conversation. |
+| `MSG <agent>` (decision) | escalate | Surface verbatim to user. Ask: "answer directly / forward to `<peer>` / pause this agent?" Do not write to mailboxes until user decides. |
+| `DEAD <agent>` | escalate | Surface the `last_err_tail` (exit code is always `?` because agents are detached subprocesses — the `.err` tail is the diagnostic). Ask: "write partial report manually / relaunch / abort?" Never auto-relaunch — rate-limits, prompt mis-parses, and JSONL mismatches each need different recovery. |
+| `SILENT <agent>` | escalate | Surface with suggested next step (`tail -n 50 .tmp/parallel-orchestrate/<tag>/logs/<agent>.out`, or send a ping to `mailbox/<agent>/inbox/`). Do NOT auto-poke — false positives during deep agent reasoning are real. |
+| `ALL_DONE` | safe | One-line summary, then transition to Phase 6 ("reading all `<n>` reports now"). |
+
+### Distinguishing FYI from decision MSGs
+
+Treat a `MSG` as a **decision** (escalate) if any of:
+- body contains a `?` not inside quoted code
+- body contains "blocked", "stuck", "should I", "which", "approve", "ok to"
+- no specific recipient peer is named
+
+Otherwise treat as **FYI** (auto-forward). **When in doubt, escalate** — over-asking is cheap; auto-deciding a contract question that should have been yours is expensive.
+
+### Re-attach
+
+If you Ctrl+C the `Monitor` mid-fanout (or it errors), agents keep running. Re-attach with the same `--watch` command; snapshot replay re-emits any pending reports and inbox messages so you don't miss the events that landed while detached.
 
 ## Phase 6 — Reconcile
 
@@ -249,6 +268,7 @@ Cleanup kills any lingering PIDs (SIGTERM, then SIGKILL after 0.5s), removes the
 | Assign Opus to every agent by default | Score each task first. Mechanical tasks with explicit instructions are Sonnet. Pure read/report tasks are Haiku. |
 | Stash before fanout without checking `??` lines | `git stash` skips untracked files. New source files won't appear in worktrees. Use `git stash -u` or commit them first. |
 | Omit `--parent` when spawning | The script refuses to run without it — the orchestrator must explicitly designate the parent JSONL |
-| Forget the orchestrator has its own mailbox | Agents write to `mailbox/orchestrator/inbox/` when blocked. Poll it every monitor cycle. |
+| Forget the orchestrator has its own mailbox | Agents write to `mailbox/orchestrator/inbox/` when blocked. The `--watch` stream surfaces these as `MSG` events automatically — react per the autonomy table, don't poll manually. |
+| Skip `--watch` and revert to `--status` polling because Monitor feels heavy | The whole point of Phase 5 is event-stream. If you're cron-checking, re-read Phase 5 and start over with `--watch`. |
 | Reuse a session-tag for a second fanout while the first is still around | Pick a new tag, or `--cleanup` the old one first. The script refuses if the manifest exists. |
 | Spawn forks without propagating discipline | The script's wrapper already prepends `invoke karpathy-guidelines` to every prompt; verify it survives if you customize the wrapper |

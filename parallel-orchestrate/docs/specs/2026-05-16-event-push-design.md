@@ -158,9 +158,23 @@ If the watcher exits without ALL_DONE (e.g., crashed), do NOT auto-advance. Re-a
 with the same --watch command (snapshot replay covers any pending state) and
 investigate the crash via the watcher's stderr.
 
-(IMPLEMENTER: verify Monitor's exact semantics from its tool schema before locking
-Phase 5 prose — specifically whether the orchestrator can issue other tool calls in
-the same turn while Monitor is streaming. Adjust the wording above if needed.)
+**Verified Monitor semantics (2026-05-16, via ToolSearch):**
+
+- **Background, not blocking.** Monitor "starts a background monitor that streams events from a long-running script. Each stdout line is an event — you keep working and notifications arrive in the chat." The orchestrator can issue other tool calls in parallel while the watcher runs.
+- **Each stdout line = one notification.** Lines within 200 ms are batched into a single notification (helpful when snapshot replay emits multiple REPORT/MSG lines in quick succession on re-attach).
+- **`persistent: true` is mandatory for this use case.** Default `timeout_ms` is 300000 (5 min); max is 3600000 (1 hr). Fanouts routinely exceed 1 hr (30-90 min per agent, often multiple agents serially after a wave). Without `persistent: true`, the Monitor call would be killed mid-fanout and the watcher subprocess terminated — agents would keep running but the orchestrator would lose its event stream. Stop the watcher cleanly via `TaskStop` if needed.
+- **Exit ends the watch.** Our `ALL_DONE` → `sys.exit(0)` pattern is exactly what Monitor expects; on exit the orchestrator gets a final notification with the exit code and naturally transitions to Phase 6.
+- **Stderr does NOT trigger notifications** — only stdout. Our watcher already uses `print(..., flush=True)` to stdout. Stderr from the watcher (e.g., the "no manifest at <path>" error) lands in the Monitor's output file and can be read via `Read` if needed for diagnostics.
+
+**Implication for Phase 5 prose:** The recommended Monitor invocation is:
+```
+Monitor({
+  description: "parallel-orchestrate watch for session <tag>",
+  command: "python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py --session-tag <tag> --watch --silent-min 5",
+  persistent: true,
+  timeout_ms: 3600000   // ignored when persistent=true but required by schema
+})
+```
 
 For ad-hoc snapshots outside an active --watch session, --status still works.
 
