@@ -209,12 +209,16 @@ def build_agent_prompt(
         f"Peers running in parallel: {peer_list}. The orchestrator is also reachable as 'orchestrator'. "
         f"\n\nMailbox protocol (file-based, async): "
         f"INBOX={inbox} — list it after every major step (`ls {inbox}`); read new messages, "
-        f"move them to SEEN={seen} when handled. "
+        f"move them to SEEN={seen} when handled. NEVER block on inbox via bash sleep loops — `claude -p` "
+        f"has no event loop; idle bash waits trigger Anthropic API stream's idle timeout (~5–10 min) and "
+        f"kill the process with `API Error: Stream idle timeout`. "
         f"To message a peer or the orchestrator, write a markdown file to "
         f"`{mailbox_root}/<recipient>/inbox/<UTC-timestamp>-from-{task_name}.md` and "
         f"mirror a copy into your OUTBOX={outbox} for audit. "
         f"Use messaging only when you genuinely need something from a peer (shared interface "
-        f"contract, blocking question) — not for status chatter. "
+        f"contract, blocking question) — not for status chatter. AFTER sending a blocking-decision "
+        f"MSG: write a PARTIAL REPORT capturing your WIP state + the question, THEN EXIT. The "
+        f"orchestrator will spawn a continuation agent with the decision embedded — do NOT wait. "
         f"\n\nMandate: {user_mandate} "
         f"\n\nDone when: (a) your scope is implemented and tests pass on this branch, "
         f"(b) report written to {report} with sections: Mandate · What I did · What I skipped + why · "
@@ -222,7 +226,7 @@ def build_agent_prompt(
         f"\n\nStop and write a partial report — DO NOT GUESS — if any of: "
         f"missing dependency / undocumented API / unclear instruction; verification fails three times "
         f"despite different fixes; spec contradicts itself or existing code; you need to touch a file "
-        f"outside your scope to finish. In any of these, message orchestrator before stopping."
+        f"outside your scope to finish. In any of these, message orchestrator AND THEN STOP."
     )
 
 
