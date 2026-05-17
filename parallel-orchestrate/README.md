@@ -108,9 +108,17 @@ Use it for **interface contracts and blocking questions**, not status chatter. R
 ## Inspect / monitor
 
 ```bash
-# alive procs, reports landed, orchestrator inbox depth
+# one-shot snapshot — alive procs, reports landed, orchestrator inbox depth
 python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
   --session-tag <tag> --status
+
+# live TUI dashboard — open in a separate terminal window/tab; refreshes every 2s
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --dashboard
+
+# event-stream for the orchestrator session (Monitor tool)
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --watch --silent-min 5
 
 # tail a specific agent's log
 tail -f .tmp/parallel-orchestrate/<tag>/logs/<agent>.out
@@ -118,6 +126,8 @@ tail -f .tmp/parallel-orchestrate/<tag>/logs/<agent>.out
 # orchestrator's brokering queue
 ls .tmp/parallel-orchestrate/<tag>/mailbox/orchestrator/inbox/
 ```
+
+`--dashboard` shows per-agent state (● RUN / ◐ SILENT / ✓ REPORT / ✗ DEAD), runtime, mailbox depth, and worktree `M=… ??=…` counts; same SILENT cross-check as the watcher (uncommitted edits disprove a false-positive stall). Requires the `rich` Python library (`pip3 install rich`).
 
 ## Cleanup
 

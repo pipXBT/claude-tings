@@ -500,6 +500,93 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- agent-state
+
+
+def _git_porcelain_counts(cwd: str) -> tuple[int, int]:
+    """Return (modified, untracked) file counts from `git status --porcelain`.
+    (0, 0) if cwd is missing or git is unavailable. Used both for the SILENT
+    cross-check and for the dashboard's worktree-activity column."""
+    if not cwd or not Path(cwd).is_dir():
+        return 0, 0
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return 0, 0
+    if r.returncode != 0:
+        return 0, 0
+    modified = untracked = 0
+    for line in r.stdout.splitlines():
+        if line.startswith("??"):
+            untracked += 1
+        elif line:
+            modified += 1
+    return modified, untracked
+
+
+def _agent_state(sess_dir: Path, agent: dict, silent_sec: float) -> dict:
+    """Compute the current state of one agent. Pure-ish (touches filesystem +
+    ps + git) but no side effects. Shared by --dashboard and (eventually) the
+    --watch event scanners."""
+    name = agent["task_name"]
+    pid = agent.get("pid", 0)
+    cwd = agent.get("cwd", "")
+    report_path = sess_dir / "reports" / f"{name}.md"
+    log_path = sess_dir / "logs" / f"{name}.out"
+    inbox = sess_dir / "mailbox" / name / "inbox"
+
+    alive = bool(pid) and is_process_alive(pid)
+    has_report = report_path.is_file()
+    inbox_count = len(list(inbox.glob("*"))) if inbox.is_dir() else 0
+    modified, untracked = _git_porcelain_counts(cwd)
+
+    # State precedence: REPORT (terminal good) > DEAD (terminal bad) >
+    # SILENT (alive but suspicious) > RUN. REPORT wins over DEAD because an
+    # agent that wrote its report and exited cleanly is done, not failed.
+    if has_report:
+        state = "REPORT"
+    elif not alive:
+        state = "DEAD"
+    else:
+        # alive + no report — check for SILENT with cross-check against
+        # the claude CLI's stdout block-buffering. If the worktree has any
+        # uncommitted changes, the agent is genuinely working and the log
+        # silence is a libc buffering artefact, not a stall.
+        is_silent = False
+        if log_path.is_file():
+            age = time.time() - log_path.stat().st_mtime
+            if age >= silent_sec and (modified + untracked) == 0:
+                is_silent = True
+        state = "SILENT" if is_silent else "RUN"
+
+    # Runtime: pid file is written immediately after Popen — its ctime is
+    # the best approximation of the agent's birth time available without
+    # parsing `ps -o etime`.
+    runtime_sec: int | None = None
+    pid_file_str = agent.get("pid_file", "")
+    if pid_file_str:
+        pid_file = Path(pid_file_str)
+        if pid_file.is_file():
+            runtime_sec = int(time.time() - pid_file.stat().st_ctime)
+
+    return {
+        "name": name,
+        "model": agent.get("model", ""),
+        "pid": pid,
+        "state": state,
+        "alive": alive,
+        "has_report": has_report,
+        "inbox_count": inbox_count,
+        "modified": modified,
+        "untracked": untracked,
+        "runtime_sec": runtime_sec,
+        "branch": agent.get("branch", ""),
+    }
+
+
 # ------------------------------------------------------------------------ status
 
 
@@ -680,6 +767,149 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- dashboard
+
+# Per-state cell style for the dashboard table. Amber/yellow is the active /
+# in-flight family (matches the user's CRT-amber terminal aesthetic — see
+# user_terminal_aesthetic memory). Green = terminal good. Red = terminal bad.
+_DASHBOARD_STATE_STYLE = {
+    "RUN":     ("●", "bold yellow"),
+    "SILENT":  ("◐", "yellow dim"),
+    "REPORT":  ("✓", "bold green"),
+    "DEAD":    ("✗", "bold red"),
+}
+
+
+def _build_dashboard_panel(
+    *,
+    sess_dir: Path,
+    manifest: dict,
+    silent_sec: float,
+    session_tag: str,
+    started_at: float,
+):
+    """Compose the rich Panel rendered on each refresh tick.
+
+    Split out from the Live loop so tests can call it with a recording
+    Console and assert on the textual output without owning a TTY.
+    """
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    agents = manifest.get("spawns", [])
+    agent_states = [_agent_state(sess_dir, a, silent_sec) for a in agents]
+
+    table = Table(show_header=True, header_style="bold yellow", box=None, padding=(0, 1))
+    table.add_column("AGENT", style="yellow", no_wrap=True)
+    table.add_column("MODEL", style="dim", no_wrap=True)
+    table.add_column("PID", style="dim", justify="right", no_wrap=True)
+    table.add_column("STATE", no_wrap=True)
+    table.add_column("RUNTIME", style="dim", justify="right", no_wrap=True)
+    table.add_column("INBOX", justify="right", no_wrap=True)
+    table.add_column("WORKTREE", style="dim", no_wrap=True)
+
+    for s in agent_states:
+        icon, style = _DASHBOARD_STATE_STYLE.get(s["state"], ("?", "white"))
+        state_cell = Text(f"{icon} {s['state']}", style=style)
+        if s["runtime_sec"] is not None:
+            mm, ss = divmod(s["runtime_sec"], 60)
+            runtime = f"{mm:02d}:{ss:02d}"
+        else:
+            runtime = "—"
+        inbox_cell = Text(
+            str(s["inbox_count"]) if s["inbox_count"] else "·",
+            style="bold yellow" if s["inbox_count"] else "dim",
+        )
+        if s["modified"] or s["untracked"]:
+            wt_cell = Text(f"M={s['modified']} ??={s['untracked']}", style="yellow")
+        else:
+            wt_cell = Text("·", style="dim")
+        table.add_row(
+            s["name"], s["model"], str(s["pid"]), state_cell, runtime, inbox_cell, wt_cell,
+        )
+
+    orch_inbox = sess_dir / "mailbox" / "orchestrator" / "inbox"
+    orch_count = len(list(orch_inbox.glob("*"))) if orch_inbox.is_dir() else 0
+    reports = sum(1 for s in agent_states if s["has_report"])
+    alive = sum(1 for s in agent_states if s["alive"])
+    dead = sum(1 for s in agent_states if s["state"] == "DEAD")
+
+    footer = Text()
+    footer.append("orch-inbox=", style="dim")
+    footer.append(str(orch_count), style="bold yellow" if orch_count else "dim")
+    footer.append(f"   reports={reports}/{len(agents)}", style="dim")
+    footer.append(f"   alive={alive}", style="dim")
+    footer.append("   dead=", style="dim")
+    footer.append(str(dead), style="bold red" if dead else "dim")
+
+    elapsed = int(time.time() - started_at)
+    em, es = divmod(elapsed, 60)
+    eh, em = divmod(em, 60)
+    elapsed_str = f"{eh:02d}:{em:02d}:{es:02d}"
+
+    title = Text()
+    title.append(" parallel-orchestrate ", style="bold black on yellow")
+    title.append(f" session={session_tag}   elapsed={elapsed_str} ", style="bold yellow")
+
+    return Panel(
+        Group(table, Text(""), footer),
+        title=title,
+        border_style="yellow",
+        padding=(0, 1),
+    )
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Live TUI dashboard for a running fanout. Designed to run in a separate
+    terminal window/tab while the orchestrator conversation continues
+    elsewhere. Refreshes every poll_sec; Ctrl+C exits cleanly."""
+    try:
+        from rich.console import Console
+        from rich.live import Live
+    except ImportError:
+        sys.exit(
+            "spawn-parallel: --dashboard requires the `rich` library.\n"
+            "  Install with: pip3 install rich  (or: python3 -m pip install --user rich)"
+        )
+
+    _root = Path(os.environ.get("PO_TMP_ROOT", os.getcwd()))
+    sess_dir = _root / ".tmp" / "parallel-orchestrate" / args.session_tag
+    manifest_path = sess_dir / "manifest.json"
+    if not manifest_path.is_file():
+        sys.exit(f"spawn-parallel: no manifest at {manifest_path}.")
+    manifest = json.loads(manifest_path.read_text())
+
+    silent_sec = args.silent_min * 60.0
+    started_at = manifest_path.stat().st_mtime  # fanout creation moment
+
+    console = Console()
+
+    def _render():
+        # Re-read manifest each tick so a --cleanup elsewhere shows up.
+        try:
+            current = json.loads(manifest_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            current = manifest
+        return _build_dashboard_panel(
+            sess_dir=sess_dir,
+            manifest=current,
+            silent_sec=silent_sec,
+            session_tag=args.session_tag,
+            started_at=started_at,
+        )
+
+    try:
+        with Live(_render(), console=console, refresh_per_second=4, screen=True) as live:
+            while True:
+                time.sleep(args.poll_sec)
+                live.update(_render())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 # ----------------------------------------------------------------------- argparse
 
 
@@ -731,8 +961,13 @@ def main() -> int:
     ap.add_argument("--watch", action="store_true",
                     help="Stream structured event lines (REPORT/MSG/DEAD/SILENT/ALL_DONE) "
                          "to stdout until fanout completes. Designed for the Monitor tool.")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="Open a live TUI showing per-agent state, runtime, mailbox depth, "
+                         "and worktree git activity. Run in a separate terminal window/tab "
+                         "alongside the orchestrator. Requires the `rich` library.")
     ap.add_argument("--silent-min", type=float, default=5.0,
-                    help="Minutes of no-log-growth before emitting SILENT (default 5.0).")
+                    help="Minutes of no-log-growth before flagging SILENT (default 5.0). "
+                         "Used by both --watch and --dashboard.")
     ap.add_argument("--poll-sec", type=float, default=2.0,
                     help="Poll interval in seconds (default 2.0).")
 
@@ -744,8 +979,12 @@ def main() -> int:
         return cmd_status(args)
     if args.watch:
         return cmd_watch(args)
+    if args.dashboard:
+        return cmd_dashboard(args)
     if not args.task:
-        ap.error("one of --task (one or more), --status, --cleanup, or --watch is required")
+        ap.error(
+            "one of --task (one or more), --status, --cleanup, --watch, or --dashboard is required"
+        )
     return cmd_spawn(args)
 
 

@@ -134,6 +134,22 @@ orchestrator's `Monitor` tool can deliver each line as a notification.
   Switching to native fs-watching would add OS-specific code without measurable
   benefit.
 
+## `--dashboard` mode (live TUI)
+
+`cmd_dashboard()` opens a `rich.live.Live` panel (alt-buffer, owns the TTY) that refreshes every `--poll-sec` (default 2 s). Read-only: never writes to the manifest, mailbox, or logs. Intended to run in a separate terminal window/tab alongside the orchestrator session.
+
+### Shared state-determination
+
+`_agent_state(sess_dir, agent, silent_sec)` is the pure-ish helper that computes one row of the dashboard table. State precedence: `REPORT` > `DEAD` > `SILENT` > `RUN`. The SILENT branch uses the same git-porcelain cross-check as the watcher's `scan_silent()` (uncommitted edits in the worktree disprove a stale-log false positive). When extending the watcher's state logic, change `_agent_state()` first so both surfaces stay in sync.
+
+### Rendering split
+
+`_build_dashboard_panel()` composes the rich Panel from a snapshot; `cmd_dashboard()` only runs the Live loop. The split exists so tests can call `_build_dashboard_panel()` with a recording `Console` and assert on textual output without owning a TTY — see `tests/test_dashboard.py::TestDashboardRenderSmoke`.
+
+### Dependency
+
+Requires the `rich` library. Falls back to a clear install message (not a stack trace) when missing.
+
 ### Environment variable
 
 - `PO_TMP_ROOT` — if set, the watcher resolves the session dir under this root

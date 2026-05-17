@@ -1,6 +1,6 @@
 ---
 name: parallel-orchestrate
-description: "Use when a design document, implementation plan, or feature spec contains multiple independent features that can be implemented simultaneously by different agents. Spawns one agent per feature in its own git worktree on a feature/<name> branch, with a file-mailbox so agents can DM each other and the orchestrator. Terminal-agnostic (iTerm2, Terminal.app, tmux, plain SSH — no multiplexer required). Invoke as `parallel-orchestrate`."
+description: "Use when a design document, implementation plan, or feature spec contains 3+ independent features that don't share files, each wanting its own branch or PR for review tooling, and the work would otherwise occupy one session for an hour or more."
 ---
 
 # parallel-orchestrate
@@ -188,7 +188,7 @@ Use messages for genuine cross-agent need: interface contracts, blocking questio
 
 When an agent sends a blocking-decision MSG to the orchestrator, it MUST exit, not wait. `claude -p` has no event loop — the only ways to "pause" are emit-tokens-continuously (expensive) or bash `sleep` loops (no tokens → Anthropic API stream's idle timeout fires after ~5–10 min → `API Error: Stream idle timeout - partial response received` → process dies, WIP often unsaved).
 
-Observed failure (HyperShield Wave 2, 2026-05-16): PR-D agent sent a crypto-scheme sign-off MSG, polled mailbox in bash loop, died ~10 min later with the API stream timeout. WIP files survived in the worktree but no commits, no PR.
+Failure mode: an agent that sleeps after sending a blocking MSG will be killed by the API stream's idle timeout ~5–10 min later. WIP files often survive in the worktree but with no commits and no PR — recovery means committing on the dead agent's behalf or relaunching.
 
 Protocol after sending a blocking MSG:
 
@@ -220,84 +220,41 @@ If the watcher exits without emitting `ALL_DONE` (crashed or killed), do NOT aut
 
 For ad-hoc snapshots outside an active `--watch`, `--status` still works.
 
-### Autonomy reaction table
+### Dashboard (live TUI in a side window)
 
-| Event | Auto-act? | Action |
-| --- | --- | --- |
-| `WATCH_START` | safe | One-line ack in conversation: "watching `<n>` agents, session=`<tag>`". |
-| `REPORT <agent>` | safe | Note in conversation: "agent `<agent>` finished, report at `<path>`". Do NOT read the report yet — Phase 6 reads them all. |
-| `MSG <agent>` (FYI) | safe | Read the file. If it's an informational notice ("I'm changing the OrderEvent shape, here's the new type"), forward to the named peer's inbox, mirror to `seen/`, summarise in conversation. |
-| `MSG <agent>` (decision) | escalate | Surface verbatim to user. Ask: "answer directly / forward to `<peer>` / pause this agent?" Do not write to mailboxes until user decides. |
-| `DEAD <agent>` | escalate | Surface the `last_err_tail` (exit code is always `?` because agents are detached subprocesses — the `.err` tail is the diagnostic). Ask: "write partial report manually / relaunch / abort?" Never auto-relaunch — rate-limits, prompt mis-parses, and JSONL mismatches each need different recovery. |
-| `SILENT <agent>` | escalate | Cross-check before surfacing: `ps -p <pid>`, `git -C <worktree> status --porcelain`, `ls <session-dir>/reports/`. If PID is alive AND worktree shows uncommitted changes (`M` or `??`), it's almost certainly a `claude` stdout-buffering false positive — wait for the next event. Surface to user only if ALL three cross-checks show no activity. Do NOT auto-poke. See "SILENT false-positive pattern" below. |
-| `ALL_DONE` | safe | One-line summary, then transition to Phase 6 ("reading all `<n>` reports now"). |
+`--watch` is for the orchestrator session: events stream into the conversation so reactions are deterministic. But events interleave with everything else you're doing in this chat, so at-a-glance is hard. Pair `--watch` with `--dashboard` running in a separate terminal window/tab for a persistent live view:
 
-### SILENT false-positive pattern
+```bash
+python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
+  --session-tag <tag> --dashboard
+```
 
-The `claude` CLI block-buffers stdout when redirected to a non-TTY file (libc default for non-interactive streams, ~4KB+ before flush). An agent actively editing files via Edit/Write can produce no log growth for `silent_min` minutes while making real progress in the worktree — watcher emits SILENT, agent is fine. Observed twice simultaneously in HyperShield Wave 3 (2026-05-16): both agents triggered SILENT at the 5-minute mark while actively editing files; `git -C <worktree> status --porcelain` immediately disproved the stall.
+Shows per-agent state (● RUN / ◐ SILENT / ✓ REPORT / ✗ DEAD), runtime, mailbox depth, and worktree git activity (`M=…  ??=…`), refreshing every 2s. Uses the same SILENT cross-check as the watcher — uncommitted changes in the worktree disprove a stale-log SILENT, so block-buffered active editing shows correctly as RUN.
 
-The autonomy table's 3-step cross-check eliminates 100% of observed false positives:
+`orch-inbox=N` in the footer turns amber when you have unread decisions to act on. Ctrl+C exits without disturbing agents.
 
-1. `ps -p <pid>` — process alive
-2. `git -C <worktree> status --porcelain` — uncommitted changes present (`M`/`??`)
-3. `ls <session-dir>/reports/` — no premature report
+To open in a separate window (the dashboard owns its TTY via alt-buffer, so don't run it in the orchestrator's pane):
 
-If 1 + 2 are positive, ignore the SILENT and continue waiting. The watcher's `scan_silent()` (post-2026-05-16) also does this cross-check at source, so the event won't even emit when uncommitted changes exist — but the cross-check pattern remains the orchestrator's fallback if running against an older watcher.
+- **iTerm2:** `Cmd+T` for new tab, then run the command
+- **Terminal.app:** `Cmd+N` for new window, then run the command
+- **tmux:** `Ctrl-b "` to split horizontally, switch panes, run the command
+- **plain SSH:** open a second SSH session
 
-A clean wrapper fix (e.g., `stdbuf -oL claude ...`) isn't available: macOS doesn't ship `stdbuf` by default, and `claude` is a Mach-O native binary (not Node), so libc-layer buffering hints may not apply. Cross-check is the recommended pattern.
+Requires the `rich` Python library (`pip3 install rich` if missing). The dashboard is read-only and never writes to the manifest, mailbox, or logs — safe to start/stop/restart at any time during a fanout.
 
-### Distinguishing FYI from decision MSGs
+### Quick reaction guide
 
-Treat a `MSG` as a **decision** (escalate) if any of:
-- body contains a `?` not inside quoted code
-- body contains "blocked", "stuck", "should I", "which", "approve", "ok to"
-- no specific recipient peer is named
+| Event | Action |
+| --- | --- |
+| `WATCH_START` | One-line ack: "watching N agents, session=<tag>". |
+| `REPORT <agent>` | Note finished + report path. Don't read yet — Phase 6 reads all. |
+| `MSG` FYI | Auto-forward to named peer; mirror to `seen/`. |
+| `MSG` decision | **Escalate** — surface verbatim to user, await direction. |
+| `DEAD` | **Escalate** — surface `last_err_tail`, ask user (relaunch / partial / abort). Never auto-relaunch. |
+| `SILENT` | Cross-check `git -C <worktree> status --porcelain` first; uncommitted changes prove the agent is working (block-buffer artefact). |
+| `ALL_DONE` | Transition to Phase 6. |
 
-Otherwise treat as **FYI** (auto-forward). **When in doubt, escalate** — over-asking is cheap; auto-deciding a contract question that should have been yours is expensive.
-
-### Re-attach
-
-If you Ctrl+C the `Monitor` mid-fanout (or it errors), agents keep running. Re-attach with the same `--watch` command; snapshot replay re-emits any pending reports and inbox messages so you don't miss the events that landed while detached.
-
-### After a relaunch: ALL_DONE may fire spuriously
-
-The watcher's ALL_DONE heuristic is "report file present at each agent's `report_path`" — not "PID alive." After you relaunch an agent (see below), if the relaunched agent writes to a DIFFERENT report path (e.g., `<agent>-v2.md` instead of `<agent>.md`), the watcher reads the v1 report as "done" and fires ALL_DONE prematurely.
-
-Workarounds:
-1. **Overwrite the v1 report path in the relaunched agent's mandate.** Cleanest — the watcher correctly detects the new report.
-2. **Ignore the spurious ALL_DONE and poll manually** via `Bash run_in_background`:
-   ```bash
-   bash -c '
-   while kill -0 <NEW_PID> 2>/dev/null; do
-     [ -f "<NEW_REPORT_PATH>" ] && exit 0
-     sleep 30
-   done
-   '
-   ```
-
-### Relaunching a dead agent
-
-When an agent dies (DEAD event surfaced; user approves relaunch — never auto-relaunch), the script does not yet have a `--relaunch` flag, so the workflow is manual:
-
-1. Find the dead JSONL: `jq -r '.spawns[] | select(.task_name == "<agent>") | .jsonl_path' .tmp/parallel-orchestrate/<tag>/manifest.json`
-2. New UUID: `NEW_UUID=$(uuidgen | tr 'A-Z' 'a-z')`
-3. Fork the JSONL (preserves prior context including any MSGs the dead agent sent):
-   ```bash
-   cp <dead-jsonl> $(dirname <dead-jsonl>)/${NEW_UUID}.jsonl
-   ```
-4. cd to the worktree (so `claude --resume`'s encoded-cwd resolution finds the new JSONL).
-5. Launch detached, with `<continuation-prompt>` containing the decision/context the dead agent was waiting on:
-   ```bash
-   nohup claude --resume "$NEW_UUID" --model <m> --dangerously-skip-permissions \
-     -p "$(cat continuation-prompt.txt)" \
-     > .tmp/parallel-orchestrate/<tag>/logs/<agent>-r2.out \
-     2> .tmp/parallel-orchestrate/<tag>/logs/<agent>-r2.err \
-     < /dev/null &
-   NEW_PID=$!
-   ```
-6. Update `manifest.json` so Phase 7 cleanup correctly reaps the new process — swap `pid`, `uuid`, `jsonl_path`, `log_out`, `log_err`; save originals as `pid_original` etc.
-
-The continuation prompt MUST embed any decision the dead agent was waiting on — never make the relaunched agent re-enter the mailbox-wait state that killed its predecessor.
+**For every detail — full autonomy table, the FYI-vs-decision rule, SILENT cross-check rationale, re-attach behaviour, the post-relaunch ALL_DONE pitfall, and the manual relaunch procedure — see `references/monitoring-playbook.md`.** Load when you need to act on the specific event.
 
 ## Phase 6 — Reconcile
 
@@ -319,6 +276,10 @@ python3 ~/.claude/skills/parallel-orchestrate/scripts/spawn-parallel.py \
 Cleanup kills any lingering PIDs (SIGTERM, then SIGKILL after 0.5s), removes the forked JSONLs, optionally removes worktrees, optionally purges the session dir. Reports + mailbox + manifest stay by default so you can revisit a decision later.
 
 **Don't `--remove-worktrees` if PRs are open** against those branches — git worktree removal won't delete the branch, but you lose the on-disk working copy.
+
+## Script internals
+
+For extending `spawn-parallel.py`, debugging unexpected behaviour, or understanding why the script makes the choices it does (parent-JSONL handling, `--dangerously-skip-permissions`, the watcher's in-memory state, the dashboard/watcher shared state-determination, common failure modes), see `references/spawn-script-internals.md`. Load only when needed — not required reading for normal orchestration runs.
 
 ## Common mistakes
 
