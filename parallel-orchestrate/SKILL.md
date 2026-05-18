@@ -277,6 +277,53 @@ Cleanup kills any lingering PIDs (SIGTERM, then SIGKILL after 0.5s), removes the
 
 **Don't `--remove-worktrees` if PRs are open** against those branches — git worktree removal won't delete the branch, but you lose the on-disk working copy.
 
+## Phase 8 — Inter-wave handoff (compact-safe)
+
+Multi-wave runs span hours. Users will want to `/compact` between waves to keep the orchestrator session lean. This phase makes that safe: stage the next wave's plan + mandates as committed files so resume after `/compact` (or a fresh session) is one sentence.
+
+Run this between Phase 7 cleanup of wave N and Phase 1 recon of wave N+1. Skip on the final wave of a project (no next wave to hand off to).
+
+### What to write
+
+1. **`docs/<your-spec-dir>/orchestration/wave-<N+1>-plan.md`** — committed plan doc with:
+   - Recap of completed waves (file ownership, merge commit SHAs, test results, headline metrics)
+   - Next wave's agent table (branch, model, scope, score)
+   - Exact spawn command (Python wrapper preferred — shell command substitution mangles backticks in mandates)
+   - Reconcile and cleanup procedure for the next wave
+   - Pre-work needed (placeholder files, substrate edits)
+
+2. **`docs/<your-spec-dir>/orchestration/wave-<N+1>-mandates/<agent-name>.md`** — one file per planned agent. Same content the spawn command would inline. Lets the post-compact orchestrator `cat` them into the spawn invocation without re-deriving from the spec.
+
+3. **Project memory update** — append to `~/.claude/projects/<encoded-cwd>/memory/project_<slug>.md`:
+   - "Wave N: COMPLETE" with merge commit SHA + headline metrics
+   - "Wave N+1: STAGED, AWAITING SPAWN" with the plan path
+   - "To resume after /compact: tell me 'spawn Wave N+1'"
+   - Any facts surfaced this wave that future sessions need (toolchain versions, confirmed API contracts, environment quirks)
+
+### Single commit
+
+```
+docs(orchestrate): stage Wave <N+1> plan + mandates for post-compact resume
+```
+
+### Tell the user
+
+> "`/compact` is safe now. To resume, say 'spawn Wave <N+1>' — I'll read the plan + mandates + memory, do the pre-work commit, and fanout."
+
+### Why this matters
+
+Without this phase, the user faces a choice between (a) keeping the long orchestrator session alive across many waves (context bloat, slow responses, expensive) or (b) `/compact`-ing and hoping enough context survives (it usually doesn't — wave-specific decisions, mandate phrasing, and reconcile patterns get lost). Committing the plan to disk + updating memory makes (b) deterministic.
+
+### After /compact (or in a new session)
+
+Post-compact, the orchestrator re-resolves `--parent <UUID>` against the *new* JSONL (compact produces a new session UUID; agents inherit the compressed history rather than the long original — that's actually cleaner). Pre-work, spawn, monitor, reconcile, cleanup, handoff: same loop, just with a fresh, lean orchestrator session.
+
+### When to skip
+
+- Final wave of a project — no next wave to hand off to
+- User explicitly says they're staying in this session to the end
+- Single-wave fanout (rare — see "When NOT to use")
+
 ## Script internals
 
 For extending `spawn-parallel.py`, debugging unexpected behaviour, or understanding why the script makes the choices it does (parent-JSONL handling, `--dangerously-skip-permissions`, the watcher's in-memory state, the dashboard/watcher shared state-determination, common failure modes), see `references/spawn-script-internals.md`. Load only when needed — not required reading for normal orchestration runs.
@@ -302,3 +349,4 @@ For extending `spawn-parallel.py`, debugging unexpected behaviour, or understand
 | Skip `--watch` and revert to `--status` polling because Monitor feels heavy | The whole point of Phase 5 is event-stream. If you're cron-checking, re-read Phase 5 and start over with `--watch`. |
 | Reuse a session-tag for a second fanout while the first is still around | Pick a new tag, or `--cleanup` the old one first. The script refuses if the manifest exists. |
 | Spawn forks without propagating discipline | The script's wrapper already prepends `invoke karpathy-guidelines` to every prompt; verify it survives if you customize the wrapper |
+| Roll into the next wave without staging a handoff doc, then lose half the context when the user `/compact`s mid-project | Phase 8 — write `wave-<N+1>-plan.md` + mandates to `docs/<spec-dir>/orchestration/`, update memory, tell user `/compact` is safe |
